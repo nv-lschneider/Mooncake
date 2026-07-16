@@ -252,6 +252,8 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    Status preconnectSegment(SegmentID target_id);
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);

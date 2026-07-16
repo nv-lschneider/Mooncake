@@ -105,6 +105,8 @@ class NcclTransport : public Transport {
 
     Status removeMemoryBuffer(BufferDesc& desc) override;
 
+    Status preconnectSegment(SegmentID target_id);
+
     Status transferPagedSync(const PagedTransferRequest& request);
 
     const char* getName() const override { return "nccl"; }
@@ -117,6 +119,7 @@ class NcclTransport : public Transport {
     bool isNcclAllocated(uint64_t addr) const;
     bool isCudaLocation(const std::string& location) const;
     Status markFailed(NcclTask& task, const std::string& reason);
+    Status buildPreconnectContext(SegmentID target_id, TransferContext& ctx);
     Status buildTransferContext(const Request& request, TransferContext& ctx);
     Status buildTransferContext(const Request& request, size_t source_length,
                                 size_t target_length, TransferContext& ctx);
@@ -129,6 +132,7 @@ class NcclTransport : public Transport {
                               const std::shared_ptr<CommState>& comm_state,
                               std::shared_ptr<WindowState>& state);
     Status postRemoteWaitSignal(const TransferContext& ctx,
+                                const std::shared_ptr<CommState>& comm_state,
                                 uint64_t signal_value);
     Status waitForComm(const std::string& session_key,
                        std::shared_ptr<CommState>& state);
@@ -145,6 +149,7 @@ class NcclTransport : public Transport {
     bool installed_ = false;
     bool allow_external_window_buffers_ = false;
     int nccl_version_ = 0;
+    int default_cuda_device_ = -1;
     std::string local_segment_name_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> local_topology_;

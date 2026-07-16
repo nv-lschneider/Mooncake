@@ -66,11 +66,13 @@ struct NcclBootstrapDesc {
     std::vector<std::string> unique_ids;
     int comm_count = 1;
     int device_index = 0;
+    // 0 initializes the communicator; 1 releases remote device setup.
+    int phase = 0;
     std::string reply_msg;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclBootstrapDesc, session_key, unique_id,
-                                   unique_ids, comm_count, device_index,
+                                   unique_ids, comm_count, device_index, phase,
                                    reply_msg);
 };
 

@@ -108,6 +108,18 @@ std::string serializeUniqueId(const ncclUniqueId& id) {
     return out;
 }
 
+uint64_t uniqueIdFingerprint(const ncclUniqueId& id) {
+    constexpr uint64_t kOffset = 1469598103934665603ULL;
+    constexpr uint64_t kPrime = 1099511628211ULL;
+    uint64_t hash = kOffset;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&id);
+    for (size_t i = 0; i < sizeof(id); ++i) {
+        hash ^= bytes[i];
+        hash *= kPrime;
+    }
+    return hash;
+}
+
 Status deserializeUniqueId(const std::string& raw, ncclUniqueId& id) {
     if (raw.size() != sizeof(id) * 2) {
         return Status::InvalidArgument(
@@ -129,10 +141,67 @@ Status deserializeUniqueId(const std::string& raw, ncclUniqueId& id) {
 std::string makeSessionKey(const std::string& local_name,
                            const std::string& remote_name, int local_device,
                            int remote_device) {
+    std::ostringstream local_endpoint;
+    local_endpoint << local_name << ":cuda" << local_device;
+    std::ostringstream remote_endpoint;
+    remote_endpoint << remote_name << ":cuda" << remote_device;
+    const std::string local_endpoint_key = local_endpoint.str();
+    const std::string remote_endpoint_key = remote_endpoint.str();
+    const auto& first = local_endpoint_key < remote_endpoint_key
+                            ? local_endpoint_key
+                            : remote_endpoint_key;
+    const auto& second = local_endpoint_key < remote_endpoint_key
+                             ? remote_endpoint_key
+                             : local_endpoint_key;
     std::ostringstream ss;
-    ss << local_name << "->" << remote_name << ":cuda" << local_device
-       << "->cuda" << remote_device;
+    ss << "nccl-pair:" << first << "<->" << second;
     return ss.str();
+}
+
+Status findSingleNcclCudaDevice(const SegmentDesc& segment,
+                                const char* endpoint, int& device) {
+    if (segment.type != SegmentType::Memory) {
+        return Status::InvalidArgument(std::string(endpoint) +
+                                       " segment is not memory" LOC_MARK);
+    }
+
+    const auto& memory = segment.getMemory();
+    const auto* transport_attrs = memory.getTransportAttrs(NCCL);
+    if (transport_attrs && !transport_attrs->empty()) {
+        try {
+            const auto attrs = json::parse(*transport_attrs);
+            if (attrs.contains("device_index")) {
+                device = attrs.at("device_index").get<int>();
+                if (device >= 0) return Status::OK();
+            }
+        } catch (const std::exception& e) {
+            return Status::InvalidArgument(
+                std::string(endpoint) +
+                " segment has invalid NCCL endpoint metadata: " + e.what() +
+                LOC_MARK);
+        }
+    }
+
+    device = -1;
+    for (const auto& buffer : memory.buffers) {
+        if (std::find(buffer.transports.begin(), buffer.transports.end(), NCCL) ==
+            buffer.transports.end()) {
+            continue;
+        }
+        LocationParser location(buffer.location);
+        if (location.type() != "cuda" || location.index() < 0) continue;
+        if (device >= 0 && device != location.index()) {
+            return Status::InvalidArgument(
+                std::string(endpoint) +
+                " segment has NCCL buffers on multiple CUDA devices" LOC_MARK);
+        }
+        device = location.index();
+    }
+    if (device < 0) {
+        return Status::InvalidArgument(std::string(endpoint) +
+                                       " segment has no NCCL CUDA buffer" LOC_MARK);
+    }
+    return Status::OK();
 }
 
 std::string makeWindowKey(const std::string& session_key,
@@ -148,6 +217,14 @@ Status setCudaDevice(int device, int& previous_device) {
     CHECK_CUDA(cudaGetDevice(&previous_device));
     CHECK_CUDA(cudaSetDevice(device));
     return Status::OK();
+}
+
+Status initCommBlocking(ncclComm_t* comm, const ncclUniqueId& unique_id,
+                        int rank, const char* expr) {
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.blocking = 1;
+    return ncclStatus(ncclCommInitRankConfig(comm, 2, unique_id, rank, &config),
+                      expr);
 }
 
 bool peerInLsaTeam(ncclComm_t comm, int peer_rank) {
@@ -186,10 +263,19 @@ struct NcclTransport::CommState {
     Status status;
     bool initializing = false;
     bool ready = false;
+    bool comm_init_ready = false;
+    bool device_init_requested = false;
     bool peer_in_lsa = false;
     int device_index = -1;
     int local_rank = -1;
     int peer_rank = -1;
+};
+
+struct NcclBootstrapPrepared {
+    std::mutex mu;
+    std::condition_variable cv;
+    Status status;
+    bool ready = false;
 };
 
 struct NcclTransport::WindowState {
@@ -221,6 +307,7 @@ struct NcclTransport::TransferContext {
     std::string session_key;
     std::string window_key;
     std::string source_window_key;
+    bool use_paired_window_buffers = false;
 };
 
 NcclTransport::NcclTransport() = default;
@@ -246,6 +333,7 @@ Status NcclTransport::install(std::string& local_segment_name,
         return Status::InvalidArgument(
             "NCCL transport could not load CUDA platform" LOC_MARK);
     }
+    CHECK_CUDA(cudaGetDevice(&default_cuda_device_));
 
     CHECK_NCCL(ncclGetVersion(&nccl_version_));
     if (nccl_version_ < 23000) {
@@ -313,9 +401,19 @@ Status NcclTransport::install(std::string& local_segment_name,
     // Cross-node transfers use device-side NCCL GIN. Same-node LSA peers use
     // NCCL peer device pointers and CUDA D2D copies over NVLink.
     caps.gpu_to_gpu = true;
+    auto local_segment = metadata_->segmentManager().getLocal();
+    if (!local_segment || local_segment->type != SegmentType::Memory) {
+        return Status::InvalidArgument(
+            "NCCL transport local segment is not memory" LOC_MARK);
+    }
+    auto& local_memory = std::get<MemorySegmentDesc>(local_segment->detail);
+    local_memory.transport_attrs[TransportType::NCCL] =
+        json{{"device_index", default_cuda_device_}}.dump();
+    CHECK_STATUS(metadata_->segmentManager().synchronizeLocal());
     installed_ = true;
 
     LOG(INFO) << "NCCL transport installed: version=" << nccl_version_
+              << " default_cuda_device=" << default_cuda_device_
               << " allow_external_window_buffers="
               << allow_external_window_buffers_
               << " max_concurrent_tasks=" << params_.max_concurrent_tasks
@@ -491,6 +589,73 @@ Status NcclTransport::markFailed(NcclTask& task, const std::string& reason) {
     return Status::OK();
 }
 
+Status NcclTransport::buildPreconnectContext(SegmentID target_id,
+                                             TransferContext& ctx) {
+    if (target_id == LOCAL_SEGMENT_ID) {
+        return Status::InvalidArgument(
+            "NCCL preconnect expects a remote target segment" LOC_MARK);
+    }
+
+    auto local_segment = metadata_->segmentManager().getLocal();
+    if (!local_segment) {
+        return Status::InvalidArgument(
+            "NCCL preconnect local segment is unavailable" LOC_MARK);
+    }
+    if (default_cuda_device_ < 0) {
+        return Status::InvalidArgument(
+            "NCCL preconnect local CUDA device is unavailable" LOC_MARK);
+    }
+    ctx.local_device = default_cuda_device_;
+
+    CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            if (!segment) {
+                return Status::NeedsRefreshCache(
+                    "NCCL preconnect remote segment is unavailable" LOC_MARK);
+            }
+            CHECK_STATUS(findSingleNcclCudaDevice(*segment, "Remote",
+                                                  ctx.remote_device));
+            ctx.remote_segment_name = segment->name;
+            ctx.remote_rpc_addr = segment->rpc_server_addr;
+            return Status::OK();
+        }));
+    if (ctx.remote_rpc_addr.empty()) {
+        return Status::InvalidArgument(
+            "NCCL preconnect remote RPC address is empty" LOC_MARK);
+    }
+
+    ctx.target_id = target_id;
+    ctx.session_key = makeSessionKey(local_segment_name_,
+                                     ctx.remote_segment_name,
+                                     ctx.local_device, ctx.remote_device);
+    return Status::OK();
+}
+
+Status NcclTransport::preconnectSegment(SegmentID target_id) {
+    TransferContext ctx;
+    CHECK_STATUS(buildPreconnectContext(target_id, ctx));
+
+    LOG(INFO) << "NCCL eager preconnect begin: local=" << local_segment_name_
+              << ":cuda" << ctx.local_device << " remote="
+              << ctx.remote_segment_name << ":cuda" << ctx.remote_device
+              << " session=" << ctx.session_key;
+    std::shared_ptr<CommState> comm_state;
+    Status status = ensureComm(ctx, comm_state);
+    int local_rank = -1;
+    int peer_rank = -1;
+    if (comm_state) {
+        std::lock_guard<std::mutex> lock(comm_state->mu);
+        local_rank = comm_state->local_rank;
+        peer_rank = comm_state->peer_rank;
+    }
+    LOG(INFO) << "NCCL eager preconnect end: local=" << local_segment_name_
+              << " remote=" << ctx.remote_segment_name
+              << " session=" << ctx.session_key
+              << " local_rank=" << local_rank << " peer_rank=" << peer_rank
+              << " status=" << status.ToString();
+    return status;
+}
+
 Status NcclTransport::buildTransferContext(const Request& request,
                                            TransferContext& ctx) {
     return buildTransferContext(request, request.length, request.length, ctx);
@@ -631,17 +796,57 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
             request.comm_count = static_cast<int>(lanes);
             request.device_index = ctx.remote_device;
             NcclBootstrapDesc response;
+            if (pagedGinDiagEnabled()) {
+                LOG(INFO) << "NCCL comm bootstrap request: session="
+                          << ctx.session_key << " remote="
+                          << ctx.remote_rpc_addr << " device="
+                          << ctx.remote_device << " uid=0x" << std::hex
+                          << uniqueIdFingerprint(unique_id) << std::dec;
+            }
             status = ControlClient::bootstrapNccl(ctx.remote_rpc_addr,
                                                   request, response);
+            if (pagedGinDiagEnabled()) {
+                LOG(INFO) << "NCCL comm bootstrap response: session="
+                          << ctx.session_key << " status=" << status.ToString();
+            }
         }
         if (status.ok()) {
             int previous_device = 0;
             status = setCudaDevice(ctx.local_device, previous_device);
             if (status.ok()) {
                 state->lanes = lanes;
-                status = ncclStatus(
-                    ncclCommInitRank(&state->comm, 2, unique_id, 0),
-                    "ncclCommInitRank");
+                if (pagedGinDiagEnabled()) {
+                    LOG(INFO) << "NCCL comm local init begin: session="
+                              << ctx.session_key << " rank=0 device="
+                              << ctx.local_device;
+                }
+                status = initCommBlocking(&state->comm, unique_id, 0,
+                                          "ncclCommInitRankConfig(local)");
+                if (pagedGinDiagEnabled()) {
+                    LOG(INFO) << "NCCL comm local init end: session="
+                              << ctx.session_key << " status=" << status.ToString();
+                }
+                if (status.ok()) {
+                    // Rank 0 may return from communicator initialization ahead
+                    // of rank 1. Keep device-communicator setup collective by
+                    // releasing the remote side only after both ranks finish.
+                    NcclBootstrapDesc ready_request;
+                    ready_request.session_key = ctx.session_key;
+                    ready_request.phase = 1;
+                    NcclBootstrapDesc ready_response;
+                    if (pagedGinDiagEnabled()) {
+                        LOG(INFO) << "NCCL comm remote-ready request: session="
+                                  << ctx.session_key;
+                    }
+                    status = ControlClient::bootstrapNccl(ctx.remote_rpc_addr,
+                                                          ready_request,
+                                                          ready_response);
+                    if (pagedGinDiagEnabled()) {
+                        LOG(INFO) << "NCCL comm remote-ready response: session="
+                                  << ctx.session_key << " status="
+                                  << status.ToString();
+                    }
+                }
                 if (status.ok()) {
                     state->peer_in_lsa = peerInLsaTeam(state->comm,
                                                        state->peer_rank);
@@ -714,7 +919,15 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
         state->cv.notify_all();
     }
 
-    return waitForComm(ctx.session_key, state);
+    Status status = waitForComm(ctx.session_key, state);
+    if (status.ok() && !should_init && pagedGinDiagEnabled()) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        LOG(INFO) << "NCCL communicator reuse: session=" << ctx.session_key
+                  << " local_rank=" << state->local_rank
+                  << " peer_rank=" << state->peer_rank
+                  << " device=" << state->device_index;
+    }
+    return status;
 }
 
 Status NcclTransport::ensureWindow(
@@ -757,7 +970,9 @@ Status NcclTransport::ensureWindow(
             status = setCudaDevice(ctx.local_device, previous_device);
             device_changed = status.ok();
         }
-        if (status.ok()) {
+        if (status.ok() && ctx.use_paired_window_buffers) {
+            state->local_buffer = reinterpret_cast<void*>(ctx.source_base);
+        } else if (status.ok()) {
             status = ncclStatus(ncclMemAlloc(&state->local_buffer,
                                              ctx.target_length),
                                 "ncclMemAlloc(window dummy)");
@@ -811,10 +1026,11 @@ Status NcclTransport::ensureSourceWindow(
         NcclWindowDesc request;
         request.session_key = ctx.session_key;
         request.window_key = ctx.source_window_key;
+        request.addr = ctx.use_paired_window_buffers ? ctx.target_base : 0;
         request.length = ctx.source_length;
         request.device_index = ctx.remote_device;
         request.win_flags = NCCL_WIN_COLL_SYMMETRIC;
-        request.allocate_local = true;
+        request.allocate_local = !ctx.use_paired_window_buffers;
         NcclWindowDesc response;
         status = ControlClient::registerNcclWindow(ctx.remote_rpc_addr,
                                                    request, response);
@@ -849,11 +1065,12 @@ Status NcclTransport::ensureSourceWindow(
     return state->status;
 }
 
-Status NcclTransport::postRemoteWaitSignal(const TransferContext& ctx,
-                                           uint64_t signal_value) {
+Status NcclTransport::postRemoteWaitSignal(
+    const TransferContext& ctx, const std::shared_ptr<CommState>& comm_state,
+    uint64_t signal_value) {
     NcclSignalDesc request;
     request.session_key = ctx.session_key;
-    request.peer = 0;
+    request.peer = comm_state->local_rank;
     request.op_count = static_cast<int>(signal_value);
     request.signal_value = signal_value;
     request.signal_index = 0;
@@ -871,6 +1088,38 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
     response.unique_ids = request.unique_ids;
     response.comm_count = request.comm_count;
     response.device_index = request.device_index;
+    response.phase = request.phase;
+
+    if (request.phase == 1) {
+        std::shared_ptr<CommState> state;
+        {
+            std::lock_guard<std::mutex> lock(comm_mutex_);
+            auto it = comms_.find(request.session_key);
+            if (it == comms_.end()) {
+                return Status::InvalidArgument(
+                    "NCCL communicator session not found" LOC_MARK);
+            }
+            state = it->second;
+        }
+        std::unique_lock<std::mutex> lock(state->mu);
+        state->cv.wait(lock, [&] {
+            return state->comm_init_ready || !state->initializing;
+        });
+        if (!state->comm_init_ready) {
+            return state->status.ok()
+                       ? Status::InternalError(
+                             "Remote NCCL communicator initialization failed" LOC_MARK)
+                       : state->status;
+        }
+        state->device_init_requested = true;
+        lock.unlock();
+        state->cv.notify_all();
+        if (pagedGinDiagEnabled()) {
+            LOG(INFO) << "NCCL comm remote device-init released: session="
+                      << request.session_key;
+        }
+        return Status::OK();
+    }
 
     bool should_init = false;
     std::shared_ptr<CommState> state;
@@ -890,7 +1139,8 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
 
     if (!should_init) return Status::OK();
 
-    startBackground([this, state, request]() {
+    auto prepared = std::make_shared<NcclBootstrapPrepared>();
+    startBackground([this, state, request, prepared]() {
         Status status;
         const size_t lanes = request.comm_count > 0
                                  ? static_cast<size_t>(request.comm_count)
@@ -906,11 +1156,39 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
             status = setCudaDevice(request.device_index, previous_device);
             device_changed = status.ok();
         }
+        {
+            std::lock_guard<std::mutex> lock(prepared->mu);
+            prepared->status = status;
+            prepared->ready = true;
+        }
+        prepared->cv.notify_all();
         if (status.ok()) {
             state->lanes = lanes;
-            status = ncclStatus(
-                ncclCommInitRank(&state->comm, 2, unique_id, 1),
-                "ncclCommInitRank(remote)");
+            if (pagedGinDiagEnabled()) {
+                LOG(INFO) << "NCCL comm remote init begin: session="
+                          << request.session_key << " rank=1 device="
+                          << request.device_index << " uid=0x" << std::hex
+                          << uniqueIdFingerprint(unique_id) << std::dec;
+            }
+            status = initCommBlocking(&state->comm, unique_id, 1,
+                                      "ncclCommInitRankConfig(remote)");
+            if (pagedGinDiagEnabled()) {
+                LOG(INFO) << "NCCL comm remote init end: session="
+                          << request.session_key << " status=" << status.ToString();
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                state->status = status;
+                state->comm_init_ready = status.ok();
+            }
+            state->cv.notify_all();
+            if (status.ok()) {
+                std::unique_lock<std::mutex> lock(state->mu);
+                state->cv.wait(lock, [&] {
+                    return state->device_init_requested || !state->status.ok();
+                });
+                status = state->status;
+            }
             if (status.ok()) {
                 state->peer_in_lsa = peerInLsaTeam(state->comm,
                                                    state->peer_rank);
@@ -979,7 +1257,9 @@ Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
         }
         state->cv.notify_all();
     });
-    return Status::OK();
+    std::unique_lock<std::mutex> lock(prepared->mu);
+    prepared->cv.wait(lock, [&] { return prepared->ready; });
+    return prepared->status;
 }
 
 Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
@@ -1189,7 +1469,7 @@ void NcclTransport::startTransfer(NcclTask* task, NcclSubBatch* batch) {
                        1
                  : 0;
     if (status.ok() && wait_ack) {
-        status = postRemoteWaitSignal(ctx, signal_value);
+        status = postRemoteWaitSignal(ctx, comm_state, signal_value);
     }
     if (status.ok()) {
         int previous_device = 0;
@@ -1307,26 +1587,32 @@ Status NcclTransport::transferPagedSync(
     }
 
     bool has_valid_pages = false;
+    int32_t min_src_page = 0;
     int32_t max_src_page = 0;
+    int32_t min_dst_page = 0;
     int32_t max_dst_page = 0;
     for (size_t i = 0; i < page_count; ++i) {
         const int32_t src_page = request.src_page_indices[i];
         const int32_t dst_page = request.dst_page_indices[i];
         if (src_page < 0 || dst_page < 0) continue;
         if (!has_valid_pages) {
+            min_src_page = src_page;
             max_src_page = src_page;
+            min_dst_page = dst_page;
             max_dst_page = dst_page;
             has_valid_pages = true;
         } else {
+            min_src_page = std::min(min_src_page, src_page);
             max_src_page = std::max(max_src_page, src_page);
+            min_dst_page = std::min(min_dst_page, dst_page);
             max_dst_page = std::max(max_dst_page, dst_page);
         }
     }
     if (!has_valid_pages) return Status::OK();
 
-    auto page_span = [&](int32_t max_page, const char* name,
+    auto page_span = [&](int32_t min_page, int32_t max_page, const char* name,
                          size_t& span) -> Status {
-        const size_t pages = static_cast<size_t>(max_page) + 1;
+        const size_t pages = static_cast<size_t>(max_page - min_page) + 1;
         if (pages > std::numeric_limits<size_t>::max() / request.page_bytes) {
             return Status::InvalidArgument(
                 std::string(name) + " byte size overflows" LOC_MARK);
@@ -1337,8 +1623,23 @@ Status NcclTransport::transferPagedSync(
 
     size_t source_span = 0;
     size_t target_span = 0;
-    CHECK_STATUS(page_span(max_src_page, "Paged source span", source_span));
-    CHECK_STATUS(page_span(max_dst_page, "Paged target span", target_span));
+    CHECK_STATUS(page_span(min_src_page, max_src_page, "Paged source span",
+                           source_span));
+    CHECK_STATUS(page_span(min_dst_page, max_dst_page, "Paged target span",
+                           target_span));
+
+    const size_t source_base_offset = static_cast<size_t>(min_src_page)
+        * request.page_bytes;
+    const size_t target_base_offset = static_cast<size_t>(min_dst_page)
+        * request.page_bytes;
+    std::vector<int32_t> src_page_indices = request.src_page_indices;
+    std::vector<int32_t> dst_page_indices = request.dst_page_indices;
+    for (size_t i = 0; i < page_count; ++i) {
+        if (src_page_indices[i] >= 0 && dst_page_indices[i] >= 0) {
+            src_page_indices[i] -= min_src_page;
+            dst_page_indices[i] -= min_dst_page;
+        }
+    }
 
     std::vector<TransferContext> contexts;
     contexts.reserve(layer_count);
@@ -1349,19 +1650,87 @@ Status NcclTransport::transferPagedSync(
         }
         Request layer_request;
         layer_request.opcode = Request::WRITE;
-        layer_request.source = request.src_layer_ptrs[layer];
+        layer_request.source = static_cast<char*>(request.src_layer_ptrs[layer])
+            + source_base_offset;
         layer_request.target_id = request.target_id;
-        layer_request.target_offset = request.dst_layer_ptrs[layer];
+        if (request.dst_layer_ptrs[layer]
+            > std::numeric_limits<uint64_t>::max() - target_base_offset) {
+            return Status::InvalidArgument(
+                "Paged target base offset overflows" LOC_MARK);
+        }
+        layer_request.target_offset = request.dst_layer_ptrs[layer]
+            + target_base_offset;
         layer_request.length = std::max(source_span, target_span);
 
         TransferContext ctx;
         CHECK_STATUS(buildTransferContext(layer_request, source_span,
                                           target_span, ctx));
-        // Register source and target windows from their registered buffer
-        // descriptors so repeated paged transfers reuse the same NCCL windows.
+        // Page IDs are pool-relative and can be high even for a small request.
+        // Rebase near the first touched page, but keep both NCCL window bases
+        // suitably aligned. The retained byte deltas are added by the paged
+        // GIN job after the page tables have been normalized.
+        constexpr uint64_t kWindowAlignment = NCCL_WIN_REQUIRED_ALIGNMENT;
+        static_assert(kWindowAlignment > 0);
+        const uint64_t source_touched =
+            reinterpret_cast<uint64_t>(layer_request.source);
+        const uint64_t target_touched = layer_request.target_offset;
+        const uint64_t source_base =
+            source_touched - source_touched % kWindowAlignment;
+        const uint64_t target_base =
+            target_touched - target_touched % kWindowAlignment;
+        const uint64_t source_delta = source_touched - source_base;
+        const uint64_t target_delta = target_touched - target_base;
+        if (ctx.source_offset < source_delta ||
+            ctx.target_offset < target_delta) {
+            return Status::InvalidArgument(
+                "NCCL-aligned paged window starts before a registered KV "
+                "pool" LOC_MARK);
+        }
+        const uint64_t source_buffer_offset = ctx.source_offset - source_delta;
+        const uint64_t target_buffer_offset = ctx.target_offset - target_delta;
+        if (source_buffer_offset > ctx.source_length ||
+            target_buffer_offset > ctx.target_length ||
+            source_span > std::numeric_limits<uint64_t>::max() - source_delta ||
+            target_span > std::numeric_limits<uint64_t>::max() - target_delta) {
+            return Status::InvalidArgument(
+                "NCCL-aligned paged window range overflows" LOC_MARK);
+        }
+        const uint64_t source_available =
+            ctx.source_length - source_buffer_offset;
+        const uint64_t target_available =
+            ctx.target_length - target_buffer_offset;
+        const uint64_t source_window_span = source_delta + source_span;
+        const uint64_t target_window_span = target_delta + target_span;
+        const uint64_t paired_window_span =
+            std::max(source_window_span, target_window_span);
+        if (paired_window_span > source_available ||
+            paired_window_span > target_available) {
+            return Status::InvalidArgument(
+                "Paged transfer paired window span exceeds a registered KV "
+                "pool" LOC_MARK);
+        }
+        ctx.source_base = source_base;
+        ctx.target_base = target_base;
+        ctx.source_offset = source_delta;
+        ctx.target_offset = target_delta;
+        ctx.source_length = paired_window_span;
+        ctx.target_length = paired_window_span;
+        ctx.use_paired_window_buffers = true;
+        ctx.window_key = makeWindowKey(ctx.session_key, "target",
+                                       ctx.target_base, ctx.target_length);
         ctx.source_window_key = makeWindowKey(ctx.session_key, "source",
                                               ctx.source_base,
                                               ctx.source_length);
+        if (pagedGinDiagEnabled()) {
+            LOG(INFO) << "NCCL paged aligned window: layer=" << layer
+                      << " source_touched=0x" << std::hex << source_touched
+                      << " source_base=0x" << source_base << std::dec
+                      << " source_delta=" << source_delta
+                      << " target_touched=0x" << std::hex << target_touched
+                      << " target_base=0x" << target_base << std::dec
+                      << " target_delta=" << target_delta
+                      << " paired_span=" << paired_window_span;
+        }
         if (!contexts.empty()) {
             const auto& first = contexts.front();
             if (ctx.local_device != first.local_device ||
@@ -1399,7 +1768,8 @@ Status NcclTransport::transferPagedSync(
     const char* serial_sync_env = std::getenv("TENT_NCCL_PAGED_SERIAL_SYNC");
     const bool serial_sync =
         serial_sync_env && std::string(serial_sync_env) != "0";
-    CHECK_STATUS(postRemoteWaitSignal(contexts.front(), signal_value));
+    CHECK_STATUS(postRemoteWaitSignal(contexts.front(), comm_state,
+                                      signal_value));
     if (pagedGinDiagEnabled())
     {
         LOG(INFO) << "NCCL paged sync posted remote wait-ack: signal="
@@ -1463,7 +1833,7 @@ Status NcclTransport::transferPagedSync(
         }
         if (status.ok()) {
             err = cudaMemcpyAsync(d_src_pages,
-                                  request.src_page_indices.data(),
+                                  src_page_indices.data(),
                                   page_table_bytes, cudaMemcpyHostToDevice,
                                   comm_state->completion_stream);
             status = cudaStatus(err, "cudaMemcpyAsync(paged src pages)");
@@ -1471,7 +1841,7 @@ Status NcclTransport::transferPagedSync(
         }
         if (status.ok()) {
             err = cudaMemcpyAsync(d_dst_pages,
-                                  request.dst_page_indices.data(),
+                                  dst_page_indices.data(),
                                   page_table_bytes, cudaMemcpyHostToDevice,
                                   comm_state->completion_stream);
             status = cudaStatus(err, "cudaMemcpyAsync(paged dst pages)");
@@ -1511,8 +1881,8 @@ Status NcclTransport::transferPagedSync(
                 static_cast<uintptr_t>(ctx.source_base));
             char* dst_base = static_cast<char*>(peer_ptr);
             for (size_t page = 0; page < page_count; ++page) {
-                const int32_t src_page = request.src_page_indices[page];
-                const int32_t dst_page = request.dst_page_indices[page];
+                const int32_t src_page = src_page_indices[page];
+                const int32_t dst_page = dst_page_indices[page];
                 if (src_page < 0 || dst_page < 0) continue;
                 auto err = cudaMemcpyAsync(
                     dst_base + static_cast<size_t>(dst_page) *
@@ -1528,21 +1898,13 @@ Status NcclTransport::transferPagedSync(
             continue;
         }
 
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " ensure source window source_base=0x"
-                      << std::hex << ctx.source_base << std::dec
-                      << " source_length=" << ctx.source_length;
-        }
-        std::shared_ptr<WindowState> source_window_state;
-        status = ensureSourceWindow(ctx, comm_state, source_window_state);
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " ensure source window done: " << status.ToString();
-        }
-        if (!status.ok()) break;
+        // ensureWindow() registers the paired local source and remote target
+        // buffers as one symmetric GIN window. Re-registering that same pair as
+        // a separate source window forces NCCL to reserve the full virtual span
+        // between the two KV pools, even though the normalized page range is
+        // only a few pages. The single paired window is valid for both handles
+        // consumed by tentNcclGinLaunchPagedPut.
+        std::shared_ptr<WindowState> source_window_state = window_state;
 
         TentNcclPagedTransferJob job;
         job.src_page_table = d_src_pages;

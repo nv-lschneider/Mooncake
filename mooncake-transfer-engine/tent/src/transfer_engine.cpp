@@ -73,6 +73,10 @@ Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return impl_->getSegmentInfo(handle, info);
 }
 
+Status TransferEngine::preconnectSegment(SegmentID target_id) {
+    return impl_->preconnectSegment(target_id);
+}
+
 Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
                                            Location location) {
     return impl_->allocateLocalMemory(addr, size, location);

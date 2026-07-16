@@ -324,6 +324,7 @@ void ControlService::onBootstrapNccl(const std::string_view& request,
     response_desc.unique_ids = request_desc.unique_ids;
     response_desc.comm_count = request_desc.comm_count;
     response_desc.device_index = request_desc.device_index;
+    response_desc.phase = request_desc.phase;
     if (nccl_bootstrap_callback_) {
         nccl_bootstrap_callback_(request_desc, response_desc);
     } else {

@@ -522,6 +522,26 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return Status::OK();
 }
 
+Status TransferEngineImpl::preconnectSegment(SegmentID target_id) {
+#ifdef USE_NCCL
+    auto& transport = transport_list_[NCCL];
+    if (!transport) {
+        return Status::NotImplemented(
+            "NCCL transport is not available for segment preconnect" LOC_MARK);
+    }
+    auto* nccl = dynamic_cast<NcclTransport*>(transport.get());
+    if (!nccl) {
+        return Status::InternalError(
+            "NCCL transport slot has unexpected implementation" LOC_MARK);
+    }
+    return nccl->preconnectSegment(target_id);
+#else
+    (void)target_id;
+    return Status::NotImplemented(
+        "Segment preconnect requires USE_NCCL" LOC_MARK);
+#endif
+}
+
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location) {
     return allocateLocalMemory(addr, size, location, false);
