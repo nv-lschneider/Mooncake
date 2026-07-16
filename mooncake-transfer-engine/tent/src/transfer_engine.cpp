@@ -77,6 +77,14 @@ Status TransferEngine::preconnectSegment(SegmentID target_id) {
     return impl_->preconnectSegment(target_id);
 }
 
+Status TransferEngine::preconnectPagedSegment(
+    SegmentID target_id, void* local_pool_addr, size_t local_pool_length,
+    uint64_t remote_pool_addr, size_t remote_pool_length) {
+    return impl_->preconnectPagedSegment(target_id, local_pool_addr,
+                                         local_pool_length, remote_pool_addr,
+                                         remote_pool_length);
+}
+
 Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
                                            Location location) {
     return impl_->allocateLocalMemory(addr, size, location);

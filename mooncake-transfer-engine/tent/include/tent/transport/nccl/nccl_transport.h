@@ -107,6 +107,11 @@ class NcclTransport : public Transport {
 
     Status preconnectSegment(SegmentID target_id);
 
+    Status preconnectPagedSegment(SegmentID target_id, void* local_pool_addr,
+                                  size_t local_pool_length,
+                                  uint64_t remote_pool_addr,
+                                  size_t remote_pool_length);
+
     Status transferPagedSync(const PagedTransferRequest& request);
 
     const char* getName() const override { return "nccl"; }
@@ -120,6 +125,7 @@ class NcclTransport : public Transport {
     bool isCudaLocation(const std::string& location) const;
     Status markFailed(NcclTask& task, const std::string& reason);
     Status buildPreconnectContext(SegmentID target_id, TransferContext& ctx);
+    Status configurePoolWindow(TransferContext& ctx);
     Status buildTransferContext(const Request& request, TransferContext& ctx);
     Status buildTransferContext(const Request& request, size_t source_length,
                                 size_t target_length, TransferContext& ctx);

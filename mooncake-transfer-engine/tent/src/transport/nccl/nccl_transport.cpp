@@ -213,6 +213,29 @@ std::string makeWindowKey(const std::string& session_key,
     return ss.str();
 }
 
+std::string makePoolWindowKey(
+    const std::string& session_key, const std::string& local_name,
+    int local_device, uint64_t local_pool_base, uint64_t local_pool_length,
+    const std::string& remote_name, int remote_device,
+    uint64_t remote_pool_base, uint64_t remote_pool_length) {
+    auto endpoint = [](const std::string& name, int device, uint64_t base,
+                       uint64_t length) {
+        std::ostringstream ss;
+        ss << name << ":cuda" << device << ":pool:" << std::hex << base
+           << ":" << length;
+        return ss.str();
+    };
+    const std::string local = endpoint(local_name, local_device,
+                                       local_pool_base, local_pool_length);
+    const std::string remote = endpoint(remote_name, remote_device,
+                                        remote_pool_base, remote_pool_length);
+    const auto& first = local < remote ? local : remote;
+    const auto& second = local < remote ? remote : local;
+    std::ostringstream ss;
+    ss << session_key << ":window:paged-pool:" << first << "<->" << second;
+    return ss.str();
+}
+
 Status setCudaDevice(int device, int& previous_device) {
     CHECK_CUDA(cudaGetDevice(&previous_device));
     CHECK_CUDA(cudaSetDevice(device));
@@ -302,6 +325,12 @@ struct NcclTransport::TransferContext {
     uint64_t source_base = 0;
     uint64_t source_length = 0;
     uint64_t source_offset = 0;
+    uint64_t target_pool_base = 0;
+    uint64_t target_pool_length = 0;
+    uint64_t source_pool_base = 0;
+    uint64_t source_pool_length = 0;
+    uint64_t target_visible_length = 0;
+    uint64_t source_visible_length = 0;
     int local_device = -1;
     int remote_device = -1;
     std::string session_key;
@@ -656,6 +685,115 @@ Status NcclTransport::preconnectSegment(SegmentID target_id) {
     return status;
 }
 
+Status NcclTransport::configurePoolWindow(TransferContext& ctx) {
+    if (ctx.source_pool_base == 0 || ctx.target_pool_base == 0 ||
+        ctx.source_pool_length == 0 || ctx.target_pool_length == 0) {
+        return Status::InvalidArgument(
+            "NCCL paged pool window requires nonempty source and target pools"
+            LOC_MARK);
+    }
+
+    constexpr uint64_t kWindowAlignment = NCCL_WIN_REQUIRED_ALIGNMENT;
+    static_assert(kWindowAlignment > 0);
+    const uint64_t source_delta = ctx.source_pool_base % kWindowAlignment;
+    const uint64_t target_delta = ctx.target_pool_base % kWindowAlignment;
+    if (ctx.source_pool_length >
+            std::numeric_limits<uint64_t>::max() - source_delta ||
+        ctx.target_pool_length >
+            std::numeric_limits<uint64_t>::max() - target_delta) {
+        return Status::InvalidArgument(
+            "NCCL paged pool window extent overflows" LOC_MARK);
+    }
+
+    const uint64_t source_extent = source_delta + ctx.source_pool_length;
+    const uint64_t target_extent = target_delta + ctx.target_pool_length;
+    const uint64_t paired_span = std::min(source_extent, target_extent);
+    if (paired_span <= source_delta || paired_span <= target_delta) {
+        return Status::InvalidArgument(
+            "NCCL paged pools have no common transfer-visible prefix"
+            LOC_MARK);
+    }
+
+    ctx.source_base = ctx.source_pool_base - source_delta;
+    ctx.target_base = ctx.target_pool_base - target_delta;
+    ctx.source_length = paired_span;
+    ctx.target_length = paired_span;
+    ctx.source_offset = source_delta;
+    ctx.target_offset = target_delta;
+    ctx.source_visible_length = paired_span - source_delta;
+    ctx.target_visible_length = paired_span - target_delta;
+    ctx.use_paired_window_buffers = true;
+    ctx.window_key = makePoolWindowKey(
+        ctx.session_key, local_segment_name_, ctx.local_device,
+        ctx.source_pool_base, ctx.source_pool_length, ctx.remote_segment_name,
+        ctx.remote_device, ctx.target_pool_base, ctx.target_pool_length);
+    ctx.source_window_key = ctx.window_key;
+
+    if (pagedGinDiagEnabled()) {
+        LOG(INFO) << "NCCL paged persistent pool window: session="
+                  << ctx.session_key << " source_pool=0x" << std::hex
+                  << ctx.source_pool_base << " source_base=0x"
+                  << ctx.source_base << std::dec
+                  << " source_delta=" << source_delta
+                  << " source_pool_length=" << ctx.source_pool_length
+                  << " source_visible_length=" << ctx.source_visible_length
+                  << " target_pool=0x" << std::hex << ctx.target_pool_base
+                  << " target_base=0x" << ctx.target_base << std::dec
+                  << " target_delta=" << target_delta
+                  << " target_pool_length=" << ctx.target_pool_length
+                  << " target_visible_length=" << ctx.target_visible_length
+                  << " paired_span=" << paired_span
+                  << " key=" << ctx.window_key;
+    }
+    return Status::OK();
+}
+
+Status NcclTransport::preconnectPagedSegment(
+    SegmentID target_id, void* local_pool_addr, size_t local_pool_length,
+    uint64_t remote_pool_addr, size_t remote_pool_length) {
+    TransferContext ctx;
+    CHECK_STATUS(buildPreconnectContext(target_id, ctx));
+    ctx.source_pool_base = reinterpret_cast<uint64_t>(local_pool_addr);
+    ctx.source_pool_length = local_pool_length;
+    ctx.target_pool_base = remote_pool_addr;
+    ctx.target_pool_length = remote_pool_length;
+
+    auto local_segment = metadata_->segmentManager().getLocal();
+    if (!local_segment ||
+        !local_segment->findBuffer(ctx.source_pool_base,
+                                   ctx.source_pool_length)) {
+        return Status::InvalidArgument(
+            "NCCL local paged pool is not registered" LOC_MARK);
+    }
+    CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            if (!segment ||
+                !segment->findBuffer(ctx.target_pool_base,
+                                     ctx.target_pool_length)) {
+                return Status::NeedsRefreshCache(
+                    "NCCL remote paged pool is not registered" LOC_MARK);
+            }
+            return Status::OK();
+        }));
+    CHECK_STATUS(configurePoolWindow(ctx));
+
+    LOG(INFO) << "NCCL eager paged-pool preconnect begin: local="
+              << local_segment_name_ << ":cuda" << ctx.local_device
+              << " remote=" << ctx.remote_segment_name << ":cuda"
+              << ctx.remote_device << " session=" << ctx.session_key
+              << " window=" << ctx.window_key;
+    std::shared_ptr<CommState> comm_state;
+    CHECK_STATUS(ensureComm(ctx, comm_state));
+    std::shared_ptr<WindowState> window_state;
+    Status status = ensureWindow(ctx, comm_state, window_state);
+    LOG(INFO) << "NCCL eager paged-pool preconnect end: local="
+              << local_segment_name_ << " remote=" << ctx.remote_segment_name
+              << " session=" << ctx.session_key
+              << " window=" << ctx.window_key
+              << " status=" << status.ToString();
+    return status;
+}
+
 Status NcclTransport::buildTransferContext(const Request& request,
                                            TransferContext& ctx) {
     return buildTransferContext(request, request.length, request.length, ctx);
@@ -724,6 +862,10 @@ Status NcclTransport::buildTransferContext(const Request& request,
     }
 
     ctx.target_id = request.target_id;
+    ctx.target_pool_base = target_buffer.addr;
+    ctx.target_pool_length = target_buffer.length;
+    ctx.source_pool_base = source_buffer->addr;
+    ctx.source_pool_length = source_buffer->length;
     ctx.target_base = target_buffer.addr;
     ctx.target_length = target_buffer.length;
     ctx.target_offset = request.target_offset - target_buffer.addr;
@@ -1634,12 +1776,6 @@ Status NcclTransport::transferPagedSync(
         * request.page_bytes;
     std::vector<int32_t> src_page_indices = request.src_page_indices;
     std::vector<int32_t> dst_page_indices = request.dst_page_indices;
-    for (size_t i = 0; i < page_count; ++i) {
-        if (src_page_indices[i] >= 0 && dst_page_indices[i] >= 0) {
-            src_page_indices[i] -= min_src_page;
-            dst_page_indices[i] -= min_dst_page;
-        }
-    }
 
     std::vector<TransferContext> contexts;
     contexts.reserve(layer_count);
@@ -1665,71 +1801,17 @@ Status NcclTransport::transferPagedSync(
         TransferContext ctx;
         CHECK_STATUS(buildTransferContext(layer_request, source_span,
                                           target_span, ctx));
-        // Page IDs are pool-relative and can be high even for a small request.
-        // Rebase near the first touched page, but keep both NCCL window bases
-        // suitably aligned. The retained byte deltas are added by the paged
-        // GIN job after the page tables have been normalized.
-        constexpr uint64_t kWindowAlignment = NCCL_WIN_REQUIRED_ALIGNMENT;
-        static_assert(kWindowAlignment > 0);
-        const uint64_t source_touched =
-            reinterpret_cast<uint64_t>(layer_request.source);
-        const uint64_t target_touched = layer_request.target_offset;
-        const uint64_t source_base =
-            source_touched - source_touched % kWindowAlignment;
-        const uint64_t target_base =
-            target_touched - target_touched % kWindowAlignment;
-        const uint64_t source_delta = source_touched - source_base;
-        const uint64_t target_delta = target_touched - target_base;
-        if (ctx.source_offset < source_delta ||
-            ctx.target_offset < target_delta) {
+        CHECK_STATUS(configurePoolWindow(ctx));
+        const uint64_t source_pages =
+            static_cast<uint64_t>(max_src_page) + 1;
+        const uint64_t target_pages =
+            static_cast<uint64_t>(max_dst_page) + 1;
+        if (source_pages >
+                ctx.source_visible_length / request.page_bytes ||
+            target_pages > ctx.target_visible_length / request.page_bytes) {
             return Status::InvalidArgument(
-                "NCCL-aligned paged window starts before a registered KV "
-                "pool" LOC_MARK);
-        }
-        const uint64_t source_buffer_offset = ctx.source_offset - source_delta;
-        const uint64_t target_buffer_offset = ctx.target_offset - target_delta;
-        if (source_buffer_offset > ctx.source_length ||
-            target_buffer_offset > ctx.target_length ||
-            source_span > std::numeric_limits<uint64_t>::max() - source_delta ||
-            target_span > std::numeric_limits<uint64_t>::max() - target_delta) {
-            return Status::InvalidArgument(
-                "NCCL-aligned paged window range overflows" LOC_MARK);
-        }
-        const uint64_t source_available =
-            ctx.source_length - source_buffer_offset;
-        const uint64_t target_available =
-            ctx.target_length - target_buffer_offset;
-        const uint64_t source_window_span = source_delta + source_span;
-        const uint64_t target_window_span = target_delta + target_span;
-        const uint64_t paired_window_span =
-            std::max(source_window_span, target_window_span);
-        if (paired_window_span > source_available ||
-            paired_window_span > target_available) {
-            return Status::InvalidArgument(
-                "Paged transfer paired window span exceeds a registered KV "
-                "pool" LOC_MARK);
-        }
-        ctx.source_base = source_base;
-        ctx.target_base = target_base;
-        ctx.source_offset = source_delta;
-        ctx.target_offset = target_delta;
-        ctx.source_length = paired_window_span;
-        ctx.target_length = paired_window_span;
-        ctx.use_paired_window_buffers = true;
-        ctx.window_key = makeWindowKey(ctx.session_key, "target",
-                                       ctx.target_base, ctx.target_length);
-        ctx.source_window_key = makeWindowKey(ctx.session_key, "source",
-                                              ctx.source_base,
-                                              ctx.source_length);
-        if (pagedGinDiagEnabled()) {
-            LOG(INFO) << "NCCL paged aligned window: layer=" << layer
-                      << " source_touched=0x" << std::hex << source_touched
-                      << " source_base=0x" << source_base << std::dec
-                      << " source_delta=" << source_delta
-                      << " target_touched=0x" << std::hex << target_touched
-                      << " target_base=0x" << target_base << std::dec
-                      << " target_delta=" << target_delta
-                      << " paired_span=" << paired_window_span;
+                "Paged transfer page range exceeds the persistent symmetric "
+                "pool window" LOC_MARK);
         }
         if (!contexts.empty()) {
             const auto& first = contexts.front();
@@ -1898,12 +1980,9 @@ Status NcclTransport::transferPagedSync(
             continue;
         }
 
-        // ensureWindow() registers the paired local source and remote target
-        // buffers as one symmetric GIN window. Re-registering that same pair as
-        // a separate source window forces NCCL to reserve the full virtual span
-        // between the two KV pools, even though the normalized page range is
-        // only a few pages. The single paired window is valid for both handles
-        // consumed by tentNcclGinLaunchPagedPut.
+        // The persistent symmetric pool window is valid for both handles
+        // consumed by tentNcclGinLaunchPagedPut. Page IDs remain pool-relative;
+        // the base offsets account only for alignment before each pool.
         std::shared_ptr<WindowState> source_window_state = window_state;
 
         TentNcclPagedTransferJob job;

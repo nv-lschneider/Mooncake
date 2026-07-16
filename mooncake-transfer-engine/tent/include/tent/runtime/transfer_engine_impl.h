@@ -96,6 +96,11 @@ class TransferEngineImpl {
 
     Status preconnectSegment(SegmentID target_id);
 
+    Status preconnectPagedSegment(SegmentID target_id, void* local_pool_addr,
+                                  size_t local_pool_length,
+                                  uint64_t remote_pool_addr,
+                                  size_t remote_pool_length);
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);

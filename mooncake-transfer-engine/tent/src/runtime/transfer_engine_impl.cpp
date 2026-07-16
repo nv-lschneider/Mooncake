@@ -542,6 +542,35 @@ Status TransferEngineImpl::preconnectSegment(SegmentID target_id) {
 #endif
 }
 
+Status TransferEngineImpl::preconnectPagedSegment(
+    SegmentID target_id, void* local_pool_addr, size_t local_pool_length,
+    uint64_t remote_pool_addr, size_t remote_pool_length) {
+#ifdef USE_NCCL
+    auto& transport = transport_list_[NCCL];
+    if (!transport) {
+        return Status::NotImplemented(
+            "NCCL transport is not available for paged segment preconnect"
+            LOC_MARK);
+    }
+    auto* nccl = dynamic_cast<NcclTransport*>(transport.get());
+    if (!nccl) {
+        return Status::InternalError(
+            "NCCL transport slot has unexpected implementation" LOC_MARK);
+    }
+    return nccl->preconnectPagedSegment(
+        target_id, local_pool_addr, local_pool_length, remote_pool_addr,
+        remote_pool_length);
+#else
+    (void)target_id;
+    (void)local_pool_addr;
+    (void)local_pool_length;
+    (void)remote_pool_addr;
+    (void)remote_pool_length;
+    return Status::NotImplemented(
+        "Paged segment preconnect requires USE_NCCL" LOC_MARK);
+#endif
+}
+
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location) {
     return allocateLocalMemory(addr, size, location, false);
