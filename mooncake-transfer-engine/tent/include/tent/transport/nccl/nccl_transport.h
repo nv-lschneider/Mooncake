@@ -131,6 +131,10 @@ class NcclTransport : public Transport {
                                 size_t target_length, TransferContext& ctx);
     Status ensureComm(const TransferContext& ctx,
                       std::shared_ptr<CommState>& state);
+    Status getReadyComm(const TransferContext& ctx,
+                        std::shared_ptr<CommState>& state);
+    Status getReadyWindow(const TransferContext& ctx,
+                          std::shared_ptr<WindowState>& state);
     Status ensureWindow(const TransferContext& ctx,
                         const std::shared_ptr<CommState>& comm_state,
                         std::shared_ptr<WindowState>& state);

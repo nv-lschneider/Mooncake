@@ -17,7 +17,9 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
@@ -83,6 +85,20 @@ bool pagedGinDiagEnabled() {
            envFlagEnabled("TRTLLM_MOONCAKE_PAGED_GIN_DIAG");
 }
 
+
+bool pagedGinSummaryDiagEnabled() {
+    return envFlagEnabled("TENT_NCCL_PAGED_SUMMARY_DIAG");
+}
+
+using PagedDiagClock = std::chrono::steady_clock;
+
+int64_t elapsedMicros(PagedDiagClock::time_point start,
+                      PagedDiagClock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+        .count();
+}
+
+std::atomic<uint64_t> pagedTransferDiagSequence{0};
 #define CHECK_NCCL(call)                       \
     do {                                       \
         Status _s = ncclStatus(call, #call);   \
@@ -906,6 +922,56 @@ Status NcclTransport::waitForComm(const std::string& session_key,
     return state->status;
 }
 
+Status NcclTransport::getReadyComm(
+    const TransferContext& ctx, std::shared_ptr<CommState>& state) {
+    {
+        std::lock_guard<std::mutex> lock(comm_mutex_);
+        auto it = comms_.find(ctx.session_key);
+        if (it == comms_.end()) {
+            return Status::InvalidArgument(
+                "NCCL paged serving found no preconnected communicator for session "
+                + ctx.session_key
+                + "; communicator creation is forbidden after readiness" LOC_MARK);
+        }
+        state = it->second;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mu);
+    if (!state->status.ok()) return state->status;
+    if (!state->ready) {
+        return Status::InvalidArgument(
+            "NCCL paged serving found an incomplete preconnected communicator for session "
+            + ctx.session_key
+            + "; communicator creation or waiting is forbidden after readiness" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status NcclTransport::getReadyWindow(
+    const TransferContext& ctx, std::shared_ptr<WindowState>& state) {
+    {
+        std::lock_guard<std::mutex> lock(window_mutex_);
+        auto it = windows_.find(ctx.window_key);
+        if (it == windows_.end()) {
+            return Status::InvalidArgument(
+                "NCCL paged serving found no preconnected exact pool window for key "
+                + ctx.window_key
+                + "; window registration is forbidden after readiness" LOC_MARK);
+        }
+        state = it->second;
+    }
+
+    std::lock_guard<std::mutex> lock(state->mu);
+    if (!state->status.ok()) return state->status;
+    if (!state->ready || state->window == nullptr) {
+        return Status::InvalidArgument(
+            "NCCL paged serving found an incomplete preconnected exact pool window for key "
+            + ctx.window_key
+            + "; window registration or waiting is forbidden after readiness" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status NcclTransport::ensureComm(const TransferContext& ctx,
                                  std::shared_ptr<CommState>& state) {
     bool should_init = false;
@@ -1075,13 +1141,27 @@ Status NcclTransport::ensureComm(const TransferContext& ctx,
 Status NcclTransport::ensureWindow(
     const TransferContext& ctx, const std::shared_ptr<CommState>& comm_state,
     std::shared_ptr<WindowState>& state) {
+    const bool diag = pagedGinSummaryDiagEnabled();
+    const auto total_start = PagedDiagClock::now();
+    int64_t lookup_us = 0;
+    int64_t collective_wait_us = 0;
+    int64_t rpc_us = 0;
+    int64_t set_device_us = 0;
+    int64_t alloc_us = 0;
+    int64_t register_us = 0;
+    int64_t state_wait_us = 0;
     bool should_init = false;
+    bool cache_hit = false;
+    bool waited_for_initializer = false;
+    const auto lookup_start = PagedDiagClock::now();
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
         auto& entry = windows_[ctx.window_key];
         if (!entry) entry = std::make_shared<WindowState>();
         state = entry;
         std::lock_guard<std::mutex> state_lock(state->mu);
+        cache_hit = state->ready;
+        waited_for_initializer = !state->ready && state->initializing;
         if (!state->ready && !state->initializing) {
             state->initializing = true;
             state->length = ctx.target_length;
@@ -1090,9 +1170,13 @@ Status NcclTransport::ensureWindow(
             should_init = true;
         }
     }
+    lookup_us = elapsedMicros(lookup_start, PagedDiagClock::now());
 
     if (should_init) {
-        std::lock_guard<std::mutex> collective_lock(comm_state->collective_mu);
+        const auto collective_wait_start = PagedDiagClock::now();
+        std::unique_lock<std::mutex> collective_lock(comm_state->collective_mu);
+        collective_wait_us = elapsedMicros(collective_wait_start,
+                                           PagedDiagClock::now());
         Status status;
         NcclWindowDesc request;
         request.session_key = ctx.session_key;
@@ -1103,29 +1187,39 @@ Status NcclTransport::ensureWindow(
         request.win_flags = NCCL_WIN_COLL_SYMMETRIC;
         request.allocate_local = false;
         NcclWindowDesc response;
+        const auto rpc_start = PagedDiagClock::now();
         status = ControlClient::registerNcclWindow(ctx.remote_rpc_addr,
                                                    request, response);
+        rpc_us = elapsedMicros(rpc_start, PagedDiagClock::now());
 
         int previous_device = 0;
         bool device_changed = false;
         if (status.ok()) {
+            const auto set_device_start = PagedDiagClock::now();
             status = setCudaDevice(ctx.local_device, previous_device);
+            set_device_us = elapsedMicros(set_device_start,
+                                          PagedDiagClock::now());
             device_changed = status.ok();
         }
         if (status.ok() && ctx.use_paired_window_buffers) {
             state->local_buffer = reinterpret_cast<void*>(ctx.source_base);
         } else if (status.ok()) {
+            const auto alloc_start = PagedDiagClock::now();
             status = ncclStatus(ncclMemAlloc(&state->local_buffer,
                                              ctx.target_length),
                                 "ncclMemAlloc(window dummy)");
+            alloc_us = elapsedMicros(alloc_start, PagedDiagClock::now());
             state->owns_local_buffer = status.ok();
         }
         if (status.ok()) {
+            const auto register_start = PagedDiagClock::now();
             status = ncclStatus(
                 ncclCommWindowRegister(comm_state->comm, state->local_buffer,
                                        ctx.target_length, &state->window,
                                        NCCL_WIN_COLL_SYMMETRIC),
                 "ncclCommWindowRegister");
+            register_us = elapsedMicros(register_start,
+                                        PagedDiagClock::now());
         }
         if (device_changed) cudaSetDevice(previous_device);
 
@@ -1138,9 +1232,31 @@ Status NcclTransport::ensureWindow(
         state->cv.notify_all();
     }
 
+    const auto state_wait_start = PagedDiagClock::now();
     std::unique_lock<std::mutex> lock(state->mu);
     state->cv.wait(lock, [&] { return state->ready || !state->status.ok(); });
-    return state->status;
+    state_wait_us = elapsedMicros(state_wait_start, PagedDiagClock::now());
+    Status result = state->status;
+    lock.unlock();
+
+    if (diag && (should_init || waited_for_initializer)) {
+        LOG(INFO) << "NCCL paged ensure-window summary: key=" << ctx.window_key
+                  << " cache_hit=" << cache_hit
+                  << " initialized_here=" << should_init
+                  << " waited_for_initializer=" << waited_for_initializer
+                  << " paired_buffers=" << ctx.use_paired_window_buffers
+                  << " lookup_us=" << lookup_us
+                  << " collective_wait_us=" << collective_wait_us
+                  << " rpc_us=" << rpc_us
+                  << " set_device_us=" << set_device_us
+                  << " alloc_us=" << alloc_us
+                  << " register_us=" << register_us
+                  << " state_wait_us=" << state_wait_us
+                  << " total_us="
+                  << elapsedMicros(total_start, PagedDiagClock::now())
+                  << " status=" << result.ToString();
+    }
+    return result;
 }
 
 Status NcclTransport::ensureSourceWindow(
@@ -1826,8 +1942,30 @@ Status NcclTransport::transferPagedSync(
         contexts.push_back(std::move(ctx));
     }
 
+    const bool summary_diag = pagedGinSummaryDiagEnabled();
+    const uint64_t diag_id = summary_diag
+        ? pagedTransferDiagSequence.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
+    const auto transfer_start = PagedDiagClock::now();
+    int64_t ensure_comm_us = 0;
+    int64_t set_device_us = 0;
+    int64_t malloc_us = 0;
+    int64_t page_copy_enqueue_us = 0;
+    int64_t ensure_window_us = 0;
+    int64_t job_copy_enqueue_us = 0;
+    int64_t put_enqueue_us = 0;
+    int64_t ack_enqueue_us = 0;
+    int64_t event_create_us = 0;
+    int64_t event_record_us = 0;
+    int64_t event_sync_us = 0;
+    int64_t event_destroy_us = 0;
+    int64_t free_us = 0;
+
     std::shared_ptr<CommState> comm_state;
-    CHECK_STATUS(ensureComm(contexts.front(), comm_state));
+    const auto ensure_comm_start = PagedDiagClock::now();
+    Status ensure_comm_status = getReadyComm(contexts.front(), comm_state);
+    ensure_comm_us = elapsedMicros(ensure_comm_start, PagedDiagClock::now());
+    CHECK_STATUS(ensure_comm_status);
     // Paged KV issues one transfer per page per layer. The LSA path becomes a
     // cudaMemcpyAsync page loop, which is much slower than fused GIN on GB200.
     // Keep LSA for regular contiguous transfers, but route paged transfers to GIN
@@ -1867,8 +2005,10 @@ Status NcclTransport::transferPagedSync(
         LOG(INFO) << "NCCL paged sync phase: set source device="
                   << contexts.front().local_device;
     }
+    const auto set_device_start = PagedDiagClock::now();
     Status status = setCudaDevice(contexts.front().local_device,
                                   previous_device);
+    set_device_us = elapsedMicros(set_device_start, PagedDiagClock::now());
     bool device_changed = status.ok();
     int32_t* d_src_pages = nullptr;
     int32_t* d_dst_pages = nullptr;
@@ -1879,7 +2019,9 @@ Status NcclTransport::transferPagedSync(
     auto cleanup_device_allocations = [&]() {
         auto free_one = [&](void* ptr, const char* name) {
             if (!ptr) return;
+            const auto free_start = PagedDiagClock::now();
             auto err = cudaFree(ptr);
+            free_us += elapsedMicros(free_start, PagedDiagClock::now());
             if (err != cudaSuccess) {
                 if (status.ok()) {
                     status = cudaStatus(err, name);
@@ -1900,6 +2042,7 @@ Status NcclTransport::transferPagedSync(
             LOG(INFO) << "NCCL paged sync phase: allocate/copy page tables bytes="
                       << page_table_bytes;
         }
+        const auto malloc_start = PagedDiagClock::now();
         auto err = cudaMalloc(reinterpret_cast<void**>(&d_src_pages),
                               page_table_bytes);
         status = cudaStatus(err, "cudaMalloc(paged src pages)");
@@ -1913,6 +2056,8 @@ Status NcclTransport::transferPagedSync(
                              sizeof(TentNcclPagedTransferJob));
             status = cudaStatus(err, "cudaMalloc(paged job)");
         }
+        malloc_us = elapsedMicros(malloc_start, PagedDiagClock::now());
+        const auto page_copy_start = PagedDiagClock::now();
         if (status.ok()) {
             err = cudaMemcpyAsync(d_src_pages,
                                   src_page_indices.data(),
@@ -1929,6 +2074,8 @@ Status NcclTransport::transferPagedSync(
             status = cudaStatus(err, "cudaMemcpyAsync(paged dst pages)");
             if (status.ok()) work_enqueued = true;
         }
+        page_copy_enqueue_us =
+            elapsedMicros(page_copy_start, PagedDiagClock::now());
     }
 
     TentNcclPagedKvLayout layout;
@@ -1944,7 +2091,10 @@ Status NcclTransport::transferPagedSync(
                       << " target_length=" << ctx.target_length;
         }
         std::shared_ptr<WindowState> window_state;
-        status = ensureWindow(ctx, comm_state, window_state);
+        const auto ensure_window_start = PagedDiagClock::now();
+        status = getReadyWindow(ctx, window_state);
+        ensure_window_us +=
+            elapsedMicros(ensure_window_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
         {
             LOG(INFO) << "NCCL paged sync phase: layer " << layer
@@ -2003,10 +2153,13 @@ Status NcclTransport::transferPagedSync(
                       << " dst_base_offset=" << job.dst_base_offset
                       << " num_pages=" << job.num_pages;
         }
+        const auto job_copy_start = PagedDiagClock::now();
         auto err = cudaMemcpyAsync(d_job, &job, sizeof(job),
                                    cudaMemcpyHostToDevice,
                                    comm_state->completion_stream);
         status = cudaStatus(err, "cudaMemcpyAsync(paged job)");
+        job_copy_enqueue_us +=
+            elapsedMicros(job_copy_start, PagedDiagClock::now());
         if (status.ok()) work_enqueued = true;
         if (!status.ok()) break;
 
@@ -2019,11 +2172,13 @@ Status NcclTransport::transferPagedSync(
             LOG(INFO) << "NCCL paged sync phase: layer " << layer
                       << " launch paged put layer_signal=" << layer_signal;
         }
+        const auto put_start = PagedDiagClock::now();
         err = tentNcclGinLaunchPagedPut(
             comm_state->dev_comm, comm_state->peer_rank, lanes,
             window_state->window, source_window_state->window, layout, d_job,
             1, layer_signal, comm_state->completion_stream);
         status = cudaStatus(err, "tentNcclGinLaunchPagedPut");
+        put_enqueue_us += elapsedMicros(put_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
         {
             LOG(INFO) << "NCCL paged sync phase: layer " << layer
@@ -2038,11 +2193,13 @@ Status NcclTransport::transferPagedSync(
             LOG(INFO) << "NCCL paged sync phase: launch source ack wait signal="
                       << signal_value;
         }
+        const auto ack_start = PagedDiagClock::now();
         auto err = tentNcclGinLaunchWaitSignal(
             comm_state->dev_comm, lanes, lanes,
             static_cast<unsigned long long>(signal_value),
             comm_state->completion_stream);
         status = cudaStatus(err, "tentNcclGinLaunchWaitSignal(paged ack)");
+        ack_enqueue_us = elapsedMicros(ack_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
         {
             LOG(INFO) << "NCCL paged sync phase: launch source ack wait done: "
@@ -2060,16 +2217,22 @@ Status NcclTransport::transferPagedSync(
         {
             LOG(INFO) << "NCCL paged sync phase: create event";
         }
+        const auto event_create_start = PagedDiagClock::now();
         auto err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
         status = cudaStatus(err, "cudaEventCreateWithFlags(paged sync)");
+        event_create_us =
+            elapsedMicros(event_create_start, PagedDiagClock::now());
     }
     if (status.ok()) {
         if (pagedGinDiagEnabled())
         {
             LOG(INFO) << "NCCL paged sync phase: record event";
         }
+        const auto event_record_start = PagedDiagClock::now();
         auto err = cudaEventRecord(event, comm_state->completion_stream);
         status = cudaStatus(err, "cudaEventRecord(paged sync)");
+        event_record_us =
+            elapsedMicros(event_record_start, PagedDiagClock::now());
     }
     if (status.ok() && !serial_sync) {
         enqueue_lock.unlock();
@@ -2079,8 +2242,11 @@ Status NcclTransport::transferPagedSync(
         {
             LOG(INFO) << "NCCL paged sync phase: synchronize event";
         }
+        const auto event_sync_start = PagedDiagClock::now();
         auto err = cudaEventSynchronize(event);
         status = cudaStatus(err, "cudaEventSynchronize(paged sync)");
+        event_sync_us =
+            elapsedMicros(event_sync_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
         {
             LOG(INFO) << "NCCL paged sync phase: synchronize event done: "
@@ -2095,9 +2261,38 @@ Status NcclTransport::transferPagedSync(
     }
 
     if (enqueue_lock.owns_lock()) enqueue_lock.unlock();
-    if (event) cudaEventDestroy(event);
+    if (event) {
+        const auto event_destroy_start = PagedDiagClock::now();
+        cudaEventDestroy(event);
+        event_destroy_us =
+            elapsedMicros(event_destroy_start, PagedDiagClock::now());
+    }
     cleanup_device_allocations();
     if (device_changed) cudaSetDevice(previous_device);
+    if (summary_diag) {
+        LOG(INFO) << "NCCL paged transfer summary: id=" << diag_id
+                  << " signal=" << signal_value
+                  << " session=" << contexts.front().session_key
+                  << " layers=" << layer_count
+                  << " pages=" << page_count
+                  << " page_bytes=" << request.page_bytes
+                  << " ensure_comm_us=" << ensure_comm_us
+                  << " set_device_us=" << set_device_us
+                  << " malloc_us=" << malloc_us
+                  << " page_copy_enqueue_us=" << page_copy_enqueue_us
+                  << " ensure_window_us=" << ensure_window_us
+                  << " job_copy_enqueue_us=" << job_copy_enqueue_us
+                  << " put_enqueue_us=" << put_enqueue_us
+                  << " ack_enqueue_us=" << ack_enqueue_us
+                  << " event_create_us=" << event_create_us
+                  << " event_record_us=" << event_record_us
+                  << " event_sync_us=" << event_sync_us
+                  << " event_destroy_us=" << event_destroy_us
+                  << " free_us=" << free_us
+                  << " total_us="
+                  << elapsedMicros(transfer_start, PagedDiagClock::now())
+                  << " status=" << status.ToString();
+    }
     return status;
 }
 
