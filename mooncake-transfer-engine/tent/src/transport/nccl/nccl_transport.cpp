@@ -285,17 +285,28 @@ Status getLsaPeerPointer(ncclWindow_t window, size_t offset, int peer,
 
 }  // namespace
 
+struct PagedWorkspace {
+    void* device_buffer = nullptr;
+    void* host_buffer = nullptr;
+    size_t capacity = 0;
+    cudaEvent_t completion_event = nullptr;
+    bool in_use = false;
+};
+
 struct NcclTransport::CommState {
     std::mutex mu;
     std::mutex collective_mu;
     std::mutex enqueue_mu;
     std::mutex remote_signal_mu;
+    std::mutex paged_workspace_mu;
     std::condition_variable remote_signal_cv;
+    std::condition_variable paged_workspace_cv;
     std::condition_variable cv;
     ncclComm_t comm = nullptr;
     ncclDevComm_t dev_comm{};
     bool dev_comm_created = false;
     cudaStream_t completion_stream = nullptr;
+    std::vector<std::unique_ptr<PagedWorkspace>> paged_workspaces;
     std::atomic<uint64_t> signal_epoch{0};
     uint64_t next_remote_signal = 1;
     size_t lanes = 1;
@@ -481,7 +492,10 @@ Status NcclTransport::uninstall() {
     {
         std::lock_guard<std::mutex> lock(comm_mutex_);
         for (auto& [_, comm] : comms_) {
-            if (comm) comm->remote_signal_cv.notify_all();
+            if (comm) {
+                comm->remote_signal_cv.notify_all();
+                comm->paged_workspace_cv.notify_all();
+            }
         }
     }
     thread_pool_.reset();
@@ -557,6 +571,43 @@ Status NcclTransport::uninstall() {
                 int previous_device = 0;
                 auto status = setCudaDevice(comm->device_index,
                                             previous_device);
+                if (status.ok()) {
+                    std::lock_guard<std::mutex> workspace_lock(
+                        comm->paged_workspace_mu);
+                    for (auto& workspace : comm->paged_workspaces) {
+                        if (!workspace) continue;
+                        if (workspace->in_use) {
+                            LOG(WARNING)
+                                << "Destroying an in-use NCCL paged workspace";
+                        }
+                        if (workspace->completion_event) {
+                            auto err = cudaEventDestroy(
+                                workspace->completion_event);
+                            if (err != cudaSuccess) {
+                                LOG(WARNING)
+                                    << "cudaEventDestroy(paged workspace): "
+                                    << cudaGetErrorString(err);
+                            }
+                        }
+                        if (workspace->device_buffer) {
+                            auto err = cudaFree(workspace->device_buffer);
+                            if (err != cudaSuccess) {
+                                LOG(WARNING)
+                                    << "cudaFree(paged workspace): "
+                                    << cudaGetErrorString(err);
+                            }
+                        }
+                        if (workspace->host_buffer) {
+                            auto err = cudaFreeHost(workspace->host_buffer);
+                            if (err != cudaSuccess) {
+                                LOG(WARNING)
+                                    << "cudaFreeHost(paged workspace): "
+                                    << cudaGetErrorString(err);
+                            }
+                        }
+                    }
+                    comm->paged_workspaces.clear();
+                }
                 if (status.ok() && comm->comm) {
                     if (comm->peer_in_lsa) {
                         LOG(INFO) << "Deferring NCCL LSA communicator cleanup "
@@ -1835,6 +1886,10 @@ Status NcclTransport::transferPagedSync(
     const size_t layer_count = request.src_layer_ptrs.size();
     const size_t page_count = request.src_page_indices.size();
     if (layer_count == 0 || page_count == 0) return Status::OK();
+    if (layer_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return Status::InvalidArgument(
+            "Paged transfer layer count is too large" LOC_MARK);
+    }
     if (page_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
         return Status::InvalidArgument(
             "Paged transfer page table is too large" LOC_MARK);
@@ -1977,26 +2032,32 @@ Status NcclTransport::transferPagedSync(
             "MC_NCCL_FORCE_GIN=1 and NCCL_CUMEM_ENABLE=1 for LSA peers"
             LOC_MARK);
     }
-    std::unique_lock<std::mutex> enqueue_lock(comm_state->enqueue_mu);
     const int lanes = static_cast<int>(comm_state->lanes);
-    const uint64_t signal_value = comm_state->signal_epoch.fetch_add(
-                                      1, std::memory_order_acq_rel) +
-        1;
     const char* wait_ack_env = std::getenv("TENT_NCCL_PAGED_WAIT_SOURCE_ACK");
     const bool wait_source_ack =
         !(wait_ack_env && std::string(wait_ack_env) == "0");
     const char* serial_sync_env = std::getenv("TENT_NCCL_PAGED_SERIAL_SYNC");
     const bool serial_sync =
         serial_sync_env && std::string(serial_sync_env) != "0";
-    CHECK_STATUS(postRemoteWaitSignal(contexts.front(), comm_state,
-                                      signal_value));
-    if (pagedGinDiagEnabled())
-    {
-        LOG(INFO) << "NCCL paged sync posted remote wait-ack: signal="
-                  << signal_value << " layers=" << layer_count
-                  << " pages=" << page_count << " page_bytes="
-                  << request.page_bytes << " wait_source_ack="
-                  << wait_source_ack << " serial_sync=" << serial_sync;
+    uint64_t signal_value = 0;
+
+    std::vector<std::shared_ptr<WindowState>> window_states;
+    window_states.reserve(contexts.size());
+    for (size_t layer = 0; layer < contexts.size(); ++layer) {
+        const auto& ctx = contexts[layer];
+        if (pagedGinDiagEnabled()) {
+            LOG(INFO) << "NCCL paged sync phase: layer " << layer
+                      << " lookup destination window target_base=0x"
+                      << std::hex << ctx.target_base << std::dec
+                      << " target_length=" << ctx.target_length;
+        }
+        std::shared_ptr<WindowState> window_state;
+        const auto ensure_window_start = PagedDiagClock::now();
+        Status window_status = getReadyWindow(ctx, window_state);
+        ensure_window_us +=
+            elapsedMicros(ensure_window_start, PagedDiagClock::now());
+        if (!window_status.ok()) return window_status;
+        window_states.push_back(std::move(window_state));
     }
 
     int previous_device = 0;
@@ -2010,100 +2071,213 @@ Status NcclTransport::transferPagedSync(
                                   previous_device);
     set_device_us = elapsedMicros(set_device_start, PagedDiagClock::now());
     bool device_changed = status.ok();
+    bool work_enqueued = false;
+    PagedWorkspace* workspace = nullptr;
     int32_t* d_src_pages = nullptr;
     int32_t* d_dst_pages = nullptr;
-    TentNcclPagedTransferJob* d_job = nullptr;
-    cudaEvent_t event = nullptr;
-    bool work_enqueued = false;
+    TentNcclPagedTransferJob* d_jobs = nullptr;
+    TentNcclPagedTransferJob* h_jobs = nullptr;
 
-    auto cleanup_device_allocations = [&]() {
-        auto free_one = [&](void* ptr, const char* name) {
-            if (!ptr) return;
-            const auto free_start = PagedDiagClock::now();
-            auto err = cudaFree(ptr);
-            free_us += elapsedMicros(free_start, PagedDiagClock::now());
-            if (err != cudaSuccess) {
-                if (status.ok()) {
-                    status = cudaStatus(err, name);
-                } else {
-                    LOG(WARNING) << name << ": " << cudaGetErrorString(err);
-                }
-            }
-        };
-        free_one(d_job, "cudaFree(paged job)");
-        free_one(d_dst_pages, "cudaFree(paged dst pages)");
-        free_one(d_src_pages, "cudaFree(paged src pages)");
+    const size_t page_table_bytes = page_count * sizeof(int32_t);
+    const size_t job_alignment = alignof(TentNcclPagedTransferJob);
+    size_t jobs_offset = 0;
+    size_t workspace_bytes = 0;
+    if (page_table_bytes >
+        (std::numeric_limits<size_t>::max() - (job_alignment - 1)) / 2) {
+        status = Status::InvalidArgument(
+            "Paged transfer workspace byte size overflows" LOC_MARK);
+    } else {
+        const size_t tables_bytes = page_table_bytes * 2;
+        jobs_offset =
+            (tables_bytes + job_alignment - 1) & ~(job_alignment - 1);
+        if (layer_count >
+            (std::numeric_limits<size_t>::max() - jobs_offset) /
+                sizeof(TentNcclPagedTransferJob)) {
+            status = Status::InvalidArgument(
+                "Paged transfer job array byte size overflows" LOC_MARK);
+        } else {
+            workspace_bytes =
+                jobs_offset + layer_count * sizeof(TentNcclPagedTransferJob);
+        }
+    }
+
+    auto release_workspace = [&]() {
+        if (!workspace) return;
+        {
+            std::lock_guard<std::mutex> lock(
+                comm_state->paged_workspace_mu);
+            workspace->in_use = false;
+        }
+        comm_state->paged_workspace_cv.notify_one();
+        workspace = nullptr;
     };
 
-    if (status.ok() && !use_lsa) {
-        const size_t page_table_bytes = page_count * sizeof(int32_t);
-        if (pagedGinDiagEnabled())
+    if (status.ok()) {
+        const auto acquire_start = PagedDiagClock::now();
+        const size_t workspace_limit =
+            std::max<size_t>(1, params_.max_concurrent_tasks);
         {
-            LOG(INFO) << "NCCL paged sync phase: allocate/copy page tables bytes="
-                      << page_table_bytes;
+            std::unique_lock<std::mutex> lock(
+                comm_state->paged_workspace_mu);
+            comm_state->paged_workspace_cv.wait(lock, [&] {
+                if (shutting_down_.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                if (comm_state->paged_workspaces.size() < workspace_limit) {
+                    return true;
+                }
+                return std::any_of(
+                    comm_state->paged_workspaces.begin(),
+                    comm_state->paged_workspaces.end(),
+                    [](const auto& candidate) {
+                        return candidate && !candidate->in_use;
+                    });
+            });
+            if (shutting_down_.load(std::memory_order_acquire)) {
+                status = Status::InvalidArgument(
+                    "NCCL transport is shutting down" LOC_MARK);
+            } else {
+                for (auto& candidate : comm_state->paged_workspaces) {
+                    if (candidate && !candidate->in_use) {
+                        workspace = candidate.get();
+                        break;
+                    }
+                }
+                if (!workspace) {
+                    auto candidate = std::make_unique<PagedWorkspace>();
+                    workspace = candidate.get();
+                    comm_state->paged_workspaces.push_back(
+                        std::move(candidate));
+                }
+                workspace->in_use = true;
+            }
         }
-        const auto malloc_start = PagedDiagClock::now();
-        auto err = cudaMalloc(reinterpret_cast<void**>(&d_src_pages),
-                              page_table_bytes);
-        status = cudaStatus(err, "cudaMalloc(paged src pages)");
-        if (status.ok()) {
-            err = cudaMalloc(reinterpret_cast<void**>(&d_dst_pages),
-                             page_table_bytes);
-            status = cudaStatus(err, "cudaMalloc(paged dst pages)");
+
+        if (status.ok() && !workspace->completion_event) {
+            const auto event_create_start = PagedDiagClock::now();
+            auto err = cudaEventCreateWithFlags(
+                &workspace->completion_event, cudaEventDisableTiming);
+            event_create_us =
+                elapsedMicros(event_create_start, PagedDiagClock::now());
+            status = cudaStatus(
+                err, "cudaEventCreateWithFlags(paged workspace)");
         }
-        if (status.ok()) {
-            err = cudaMalloc(reinterpret_cast<void**>(&d_job),
-                             sizeof(TentNcclPagedTransferJob));
-            status = cudaStatus(err, "cudaMalloc(paged job)");
+
+        if (status.ok() && !use_lsa &&
+            workspace->capacity < workspace_bytes) {
+            const auto malloc_start = PagedDiagClock::now();
+            void* new_device_buffer = nullptr;
+            void* new_host_buffer = nullptr;
+            auto err = cudaMalloc(&new_device_buffer, workspace_bytes);
+            status = cudaStatus(err, "cudaMalloc(paged workspace)");
+            if (status.ok()) {
+                err = cudaMallocHost(&new_host_buffer, workspace_bytes);
+                status = cudaStatus(err, "cudaMallocHost(paged workspace)");
+            }
+            if (!status.ok()) {
+                if (new_device_buffer) cudaFree(new_device_buffer);
+                if (new_host_buffer) cudaFreeHost(new_host_buffer);
+            } else {
+                const auto free_start = PagedDiagClock::now();
+                if (workspace->device_buffer) {
+                    err = cudaFree(workspace->device_buffer);
+                    if (err != cudaSuccess) {
+                        LOG(WARNING) << "cudaFree(old paged workspace): "
+                                     << cudaGetErrorString(err);
+                    }
+                }
+                if (workspace->host_buffer) {
+                    err = cudaFreeHost(workspace->host_buffer);
+                    if (err != cudaSuccess) {
+                        LOG(WARNING)
+                            << "cudaFreeHost(old paged workspace): "
+                            << cudaGetErrorString(err);
+                    }
+                }
+                free_us +=
+                    elapsedMicros(free_start, PagedDiagClock::now());
+                workspace->device_buffer = new_device_buffer;
+                workspace->host_buffer = new_host_buffer;
+                workspace->capacity = workspace_bytes;
+            }
+            malloc_us =
+                elapsedMicros(malloc_start, PagedDiagClock::now());
         }
-        malloc_us = elapsedMicros(malloc_start, PagedDiagClock::now());
+
+        if (status.ok() && !use_lsa) {
+            auto* d_base = static_cast<char*>(workspace->device_buffer);
+            auto* h_base = static_cast<char*>(workspace->host_buffer);
+            d_src_pages = reinterpret_cast<int32_t*>(d_base);
+            d_dst_pages =
+                reinterpret_cast<int32_t*>(d_base + page_table_bytes);
+            d_jobs = reinterpret_cast<TentNcclPagedTransferJob*>(
+                d_base + jobs_offset);
+            auto* h_src_pages = reinterpret_cast<int32_t*>(h_base);
+            auto* h_dst_pages =
+                reinterpret_cast<int32_t*>(h_base + page_table_bytes);
+            h_jobs = reinterpret_cast<TentNcclPagedTransferJob*>(
+                h_base + jobs_offset);
+            std::memcpy(h_src_pages, src_page_indices.data(),
+                        page_table_bytes);
+            std::memcpy(h_dst_pages, dst_page_indices.data(),
+                        page_table_bytes);
+            for (size_t layer = 0; layer < contexts.size(); ++layer) {
+                const auto& ctx = contexts[layer];
+                TentNcclPagedTransferJob& job = h_jobs[layer];
+                job = TentNcclPagedTransferJob{};
+                job.src_page_table = d_src_pages;
+                job.dst_page_table = d_dst_pages;
+                job.num_pages = static_cast<int>(page_count);
+                job.layer_begin = 0;
+                job.layer_end = 1;
+                job.src_base_offset =
+                    static_cast<size_t>(ctx.source_offset);
+                job.dst_base_offset =
+                    static_cast<size_t>(ctx.target_offset);
+            }
+        }
+        (void)acquire_start;
+    }
+
+    std::unique_lock<std::mutex> enqueue_lock;
+    if (status.ok()) {
+        enqueue_lock =
+            std::unique_lock<std::mutex>(comm_state->enqueue_mu);
+        signal_value = comm_state->signal_epoch.fetch_add(
+                           1, std::memory_order_acq_rel) +
+            1;
+        status = postRemoteWaitSignal(contexts.front(), comm_state,
+                                      signal_value);
+        if (pagedGinDiagEnabled()) {
+            LOG(INFO) << "NCCL paged sync posted remote wait-ack: signal="
+                      << signal_value << " layers=" << layer_count
+                      << " pages=" << page_count << " page_bytes="
+                      << request.page_bytes << " wait_source_ack="
+                      << wait_source_ack << " serial_sync=" << serial_sync;
+        }
+    }
+    if (status.ok() && !use_lsa) {
         const auto page_copy_start = PagedDiagClock::now();
-        if (status.ok()) {
-            err = cudaMemcpyAsync(d_src_pages,
-                                  src_page_indices.data(),
-                                  page_table_bytes, cudaMemcpyHostToDevice,
-                                  comm_state->completion_stream);
-            status = cudaStatus(err, "cudaMemcpyAsync(paged src pages)");
-            if (status.ok()) work_enqueued = true;
-        }
-        if (status.ok()) {
-            err = cudaMemcpyAsync(d_dst_pages,
-                                  dst_page_indices.data(),
-                                  page_table_bytes, cudaMemcpyHostToDevice,
-                                  comm_state->completion_stream);
-            status = cudaStatus(err, "cudaMemcpyAsync(paged dst pages)");
-            if (status.ok()) work_enqueued = true;
-        }
+        auto err = cudaMemcpyAsync(
+            workspace->device_buffer, workspace->host_buffer,
+            workspace_bytes, cudaMemcpyHostToDevice,
+            comm_state->completion_stream);
+        status = cudaStatus(err, "cudaMemcpyAsync(paged workspace)");
         page_copy_enqueue_us =
             elapsedMicros(page_copy_start, PagedDiagClock::now());
+        if (status.ok()) work_enqueued = true;
     }
 
     TentNcclPagedKvLayout layout;
     layout.page_stride_bytes = request.page_bytes;
 
-    for (size_t layer = 0; status.ok() && layer < contexts.size(); ++layer) {
-        const auto& ctx = contexts[layer];
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " ensure destination window target_base=0x"
-                      << std::hex << ctx.target_base << std::dec
-                      << " target_length=" << ctx.target_length;
-        }
-        std::shared_ptr<WindowState> window_state;
-        const auto ensure_window_start = PagedDiagClock::now();
-        status = getReadyWindow(ctx, window_state);
-        ensure_window_us +=
-            elapsedMicros(ensure_window_start, PagedDiagClock::now());
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " ensure destination window done: "
-                      << status.ToString();
-        }
-        if (!status.ok()) break;
-
-        if (use_lsa) {
+    if (use_lsa) {
+        // Preserve the existing LSA fallback exactly; normal Paged GIN serving
+        // forces the device-communicator path above.
+        for (size_t layer = 0;
+             status.ok() && layer < contexts.size(); ++layer) {
+            const auto& ctx = contexts[layer];
+            const auto& window_state = window_states[layer];
             void* peer_ptr = nullptr;
             status = getLsaPeerPointer(window_state->window,
                                        ctx.target_offset,
@@ -2123,68 +2297,50 @@ Status NcclTransport::transferPagedSync(
                                    request.page_bytes,
                     request.page_bytes, cudaMemcpyDeviceToDevice,
                     comm_state->completion_stream);
-                status = cudaStatus(err, "cudaMemcpyAsync(NCCL paged LSA)");
+                status = cudaStatus(
+                    err, "cudaMemcpyAsync(NCCL paged LSA)");
                 if (!status.ok()) break;
                 work_enqueued = true;
             }
-            continue;
         }
-
-        // The persistent symmetric pool window is valid for both handles
-        // consumed by tentNcclGinLaunchPagedPut. Page IDs remain pool-relative;
-        // the base offsets account only for alignment before each pool.
-        std::shared_ptr<WindowState> source_window_state = window_state;
-
-        TentNcclPagedTransferJob job;
-        job.src_page_table = d_src_pages;
-        job.dst_page_table = d_dst_pages;
-        job.num_pages = static_cast<int>(page_count);
-        job.layer_begin = 0;
-        job.layer_end = 1;
-        job.src_layer_stride = 0;
-        job.dst_layer_stride = 0;
-        job.src_base_offset = static_cast<size_t>(ctx.source_offset);
-        job.dst_base_offset = static_cast<size_t>(ctx.target_offset);
-
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " copy job src_base_offset=" << job.src_base_offset
-                      << " dst_base_offset=" << job.dst_base_offset
-                      << " num_pages=" << job.num_pages;
+    } else {
+        // Jobs can share one launch only when they use the same already-ready
+        // persistent symmetric window. Differing handles remain separate
+        // groups. Source and destination intentionally use the same symmetric
+        // pool window, matching the previously validated per-layer launch.
+        for (size_t group_begin = 0;
+             status.ok() && group_begin < contexts.size();) {
+            size_t group_end = group_begin + 1;
+            while (group_end < contexts.size() &&
+                   window_states[group_end]->window ==
+                       window_states[group_begin]->window) {
+                ++group_end;
+            }
+            const auto& window_state = window_states[group_begin];
+            const int group_jobs =
+                static_cast<int>(group_end - group_begin);
+            const unsigned long long group_signal =
+                (group_end == contexts.size())
+                ? static_cast<unsigned long long>(signal_value)
+                : 0;
+            if (pagedGinDiagEnabled()) {
+                LOG(INFO)
+                    << "NCCL paged sync phase: launch job group begin="
+                    << group_begin << " jobs=" << group_jobs
+                    << " signal=" << group_signal;
+            }
+            const auto put_start = PagedDiagClock::now();
+            auto err = tentNcclGinLaunchPagedPut(
+                comm_state->dev_comm, comm_state->peer_rank, lanes,
+                window_state->window, window_state->window, layout,
+                d_jobs + group_begin, group_jobs, group_signal,
+                comm_state->completion_stream);
+            status = cudaStatus(err, "tentNcclGinLaunchPagedPut");
+            put_enqueue_us +=
+                elapsedMicros(put_start, PagedDiagClock::now());
+            if (status.ok()) work_enqueued = true;
+            group_begin = group_end;
         }
-        const auto job_copy_start = PagedDiagClock::now();
-        auto err = cudaMemcpyAsync(d_job, &job, sizeof(job),
-                                   cudaMemcpyHostToDevice,
-                                   comm_state->completion_stream);
-        status = cudaStatus(err, "cudaMemcpyAsync(paged job)");
-        job_copy_enqueue_us +=
-            elapsedMicros(job_copy_start, PagedDiagClock::now());
-        if (status.ok()) work_enqueued = true;
-        if (!status.ok()) break;
-
-        const unsigned long long layer_signal =
-            (layer + 1 == contexts.size())
-            ? static_cast<unsigned long long>(signal_value)
-            : 0;
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " launch paged put layer_signal=" << layer_signal;
-        }
-        const auto put_start = PagedDiagClock::now();
-        err = tentNcclGinLaunchPagedPut(
-            comm_state->dev_comm, comm_state->peer_rank, lanes,
-            window_state->window, source_window_state->window, layout, d_job,
-            1, layer_signal, comm_state->completion_stream);
-        status = cudaStatus(err, "tentNcclGinLaunchPagedPut");
-        put_enqueue_us += elapsedMicros(put_start, PagedDiagClock::now());
-        if (pagedGinDiagEnabled())
-        {
-            LOG(INFO) << "NCCL paged sync phase: layer " << layer
-                      << " launch paged put done: " << status.ToString();
-        }
-        if (status.ok()) work_enqueued = true;
     }
 
     if (status.ok() && wait_source_ack) {
@@ -2215,22 +2371,12 @@ Status NcclTransport::transferPagedSync(
     if (status.ok()) {
         if (pagedGinDiagEnabled())
         {
-            LOG(INFO) << "NCCL paged sync phase: create event";
-        }
-        const auto event_create_start = PagedDiagClock::now();
-        auto err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-        status = cudaStatus(err, "cudaEventCreateWithFlags(paged sync)");
-        event_create_us =
-            elapsedMicros(event_create_start, PagedDiagClock::now());
-    }
-    if (status.ok()) {
-        if (pagedGinDiagEnabled())
-        {
             LOG(INFO) << "NCCL paged sync phase: record event";
         }
         const auto event_record_start = PagedDiagClock::now();
-        auto err = cudaEventRecord(event, comm_state->completion_stream);
-        status = cudaStatus(err, "cudaEventRecord(paged sync)");
+        auto err = cudaEventRecord(workspace->completion_event,
+                                   comm_state->completion_stream);
+        status = cudaStatus(err, "cudaEventRecord(paged workspace)");
         event_record_us =
             elapsedMicros(event_record_start, PagedDiagClock::now());
     }
@@ -2243,8 +2389,9 @@ Status NcclTransport::transferPagedSync(
             LOG(INFO) << "NCCL paged sync phase: synchronize event";
         }
         const auto event_sync_start = PagedDiagClock::now();
-        auto err = cudaEventSynchronize(event);
-        status = cudaStatus(err, "cudaEventSynchronize(paged sync)");
+        auto err = cudaEventSynchronize(workspace->completion_event);
+        status = cudaStatus(
+            err, "cudaEventSynchronize(paged workspace)");
         event_sync_us =
             elapsedMicros(event_sync_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
@@ -2261,13 +2408,7 @@ Status NcclTransport::transferPagedSync(
     }
 
     if (enqueue_lock.owns_lock()) enqueue_lock.unlock();
-    if (event) {
-        const auto event_destroy_start = PagedDiagClock::now();
-        cudaEventDestroy(event);
-        event_destroy_us =
-            elapsedMicros(event_destroy_start, PagedDiagClock::now());
-    }
-    cleanup_device_allocations();
+    release_workspace();
     if (device_changed) cudaSetDevice(previous_device);
     if (summary_diag) {
         LOG(INFO) << "NCCL paged transfer summary: id=" << diag_id
