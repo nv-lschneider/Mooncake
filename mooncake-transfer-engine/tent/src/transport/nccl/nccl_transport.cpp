@@ -90,6 +90,29 @@ bool pagedGinSummaryDiagEnabled() {
     return envFlagEnabled("TENT_NCCL_PAGED_SUMMARY_DIAG");
 }
 
+bool pagedGinAccumDiagEnabled() {
+    return envFlagEnabled("TENT_NCCL_PAGED_ACCUM_DIAG");
+}
+
+uint64_t pagedGinAccumDiagInterval() {
+    static const uint64_t interval = [] {
+        constexpr uint64_t kDefaultInterval = 64;
+        const char* value =
+            std::getenv("TENT_NCCL_PAGED_ACCUM_DIAG_INTERVAL");
+        if (!value || !*value) return kDefaultInterval;
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end == value || *end != '\0' || parsed == 0) {
+            LOG(WARNING)
+                << "Invalid TENT_NCCL_PAGED_ACCUM_DIAG_INTERVAL='"
+                << value << "'; using " << kDefaultInterval;
+            return kDefaultInterval;
+        }
+        return static_cast<uint64_t>(parsed);
+    }();
+    return interval;
+}
+
 using PagedDiagClock = std::chrono::steady_clock;
 
 int64_t elapsedMicros(PagedDiagClock::time_point start,
@@ -99,6 +122,58 @@ int64_t elapsedMicros(PagedDiagClock::time_point start,
 }
 
 std::atomic<uint64_t> pagedTransferDiagSequence{0};
+
+struct PagedTimingMetric {
+    std::atomic<uint64_t> sum_us{0};
+    std::atomic<uint64_t> max_us{0};
+
+    void add(int64_t value_us) {
+        const uint64_t value =
+            value_us > 0 ? static_cast<uint64_t>(value_us) : 0;
+        sum_us.fetch_add(value, std::memory_order_relaxed);
+        uint64_t observed = max_us.load(std::memory_order_relaxed);
+        while (observed < value &&
+               !max_us.compare_exchange_weak(
+                   observed, value, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    double average(uint64_t count) const {
+        return count == 0
+            ? 0.0
+            : static_cast<double>(sum_us.load(std::memory_order_relaxed)) /
+                  static_cast<double>(count);
+    }
+
+    uint64_t maximum() const {
+        return max_us.load(std::memory_order_relaxed);
+    }
+};
+
+struct PagedTimingAccumulator {
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> failures{0};
+    std::atomic<uint64_t> workspace_creates{0};
+    std::atomic<uint64_t> workspace_grows{0};
+    std::atomic<uint64_t> job_groups{0};
+    std::atomic<uint64_t> layers{0};
+    std::atomic<uint64_t> pages{0};
+    PagedTimingMetric ensure_comm;
+    PagedTimingMetric ensure_window;
+    PagedTimingMetric set_device;
+    PagedTimingMetric workspace_acquire;
+    PagedTimingMetric metadata_prepare;
+    PagedTimingMetric enqueue_lock_wait;
+    PagedTimingMetric post_remote_signal;
+    PagedTimingMetric malloc;
+    PagedTimingMetric h2d_enqueue;
+    PagedTimingMetric put_enqueue;
+    PagedTimingMetric ack_enqueue;
+    PagedTimingMetric event_record;
+    PagedTimingMetric event_sync;
+    PagedTimingMetric total;
+};
 #define CHECK_NCCL(call)                       \
     do {                                       \
         Status _s = ncclStatus(call, #call);   \
@@ -307,6 +382,7 @@ struct NcclTransport::CommState {
     bool dev_comm_created = false;
     cudaStream_t completion_stream = nullptr;
     std::vector<std::unique_ptr<PagedWorkspace>> paged_workspaces;
+    PagedTimingAccumulator paged_timing;
     std::atomic<uint64_t> signal_epoch{0};
     uint64_t next_remote_signal = 1;
     size_t lanes = 1;
@@ -1998,16 +2074,21 @@ Status NcclTransport::transferPagedSync(
     }
 
     const bool summary_diag = pagedGinSummaryDiagEnabled();
+    const bool accum_diag = pagedGinAccumDiagEnabled();
     const uint64_t diag_id = summary_diag
         ? pagedTransferDiagSequence.fetch_add(1, std::memory_order_relaxed) + 1
         : 0;
     const auto transfer_start = PagedDiagClock::now();
     int64_t ensure_comm_us = 0;
     int64_t set_device_us = 0;
+    int64_t workspace_acquire_us = 0;
+    int64_t metadata_prepare_us = 0;
     int64_t malloc_us = 0;
     int64_t page_copy_enqueue_us = 0;
     int64_t ensure_window_us = 0;
     int64_t job_copy_enqueue_us = 0;
+    int64_t enqueue_lock_wait_us = 0;
+    int64_t post_remote_signal_us = 0;
     int64_t put_enqueue_us = 0;
     int64_t ack_enqueue_us = 0;
     int64_t event_create_us = 0;
@@ -2015,6 +2096,9 @@ Status NcclTransport::transferPagedSync(
     int64_t event_sync_us = 0;
     int64_t event_destroy_us = 0;
     int64_t free_us = 0;
+    size_t job_group_count = 0;
+    bool workspace_created = false;
+    bool workspace_grew = false;
 
     std::shared_ptr<CommState> comm_state;
     const auto ensure_comm_start = PagedDiagClock::now();
@@ -2146,12 +2230,15 @@ Status NcclTransport::transferPagedSync(
                 if (!workspace) {
                     auto candidate = std::make_unique<PagedWorkspace>();
                     workspace = candidate.get();
+                    workspace_created = true;
                     comm_state->paged_workspaces.push_back(
                         std::move(candidate));
                 }
                 workspace->in_use = true;
             }
         }
+        workspace_acquire_us =
+            elapsedMicros(acquire_start, PagedDiagClock::now());
 
         if (status.ok() && !workspace->completion_event) {
             const auto event_create_start = PagedDiagClock::now();
@@ -2199,12 +2286,14 @@ Status NcclTransport::transferPagedSync(
                 workspace->device_buffer = new_device_buffer;
                 workspace->host_buffer = new_host_buffer;
                 workspace->capacity = workspace_bytes;
+                workspace_grew = true;
             }
             malloc_us =
                 elapsedMicros(malloc_start, PagedDiagClock::now());
         }
 
         if (status.ok() && !use_lsa) {
+            const auto metadata_prepare_start = PagedDiagClock::now();
             auto* d_base = static_cast<char*>(workspace->device_buffer);
             auto* h_base = static_cast<char*>(workspace->host_buffer);
             d_src_pages = reinterpret_cast<int32_t*>(d_base);
@@ -2235,19 +2324,26 @@ Status NcclTransport::transferPagedSync(
                 job.dst_base_offset =
                     static_cast<size_t>(ctx.target_offset);
             }
+            metadata_prepare_us = elapsedMicros(
+                metadata_prepare_start, PagedDiagClock::now());
         }
-        (void)acquire_start;
     }
 
     std::unique_lock<std::mutex> enqueue_lock;
     if (status.ok()) {
+        const auto enqueue_lock_start = PagedDiagClock::now();
         enqueue_lock =
             std::unique_lock<std::mutex>(comm_state->enqueue_mu);
+        enqueue_lock_wait_us = elapsedMicros(
+            enqueue_lock_start, PagedDiagClock::now());
         signal_value = comm_state->signal_epoch.fetch_add(
                            1, std::memory_order_acq_rel) +
             1;
+        const auto post_remote_signal_start = PagedDiagClock::now();
         status = postRemoteWaitSignal(contexts.front(), comm_state,
                                       signal_value);
+        post_remote_signal_us = elapsedMicros(
+            post_remote_signal_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled()) {
             LOG(INFO) << "NCCL paged sync posted remote wait-ack: signal="
                       << signal_value << " layers=" << layer_count
@@ -2319,6 +2415,7 @@ Status NcclTransport::transferPagedSync(
             const auto& window_state = window_states[group_begin];
             const int group_jobs =
                 static_cast<int>(group_end - group_begin);
+            ++job_group_count;
             const unsigned long long group_signal =
                 (group_end == contexts.size())
                 ? static_cast<unsigned long long>(signal_value)
@@ -2410,6 +2507,8 @@ Status NcclTransport::transferPagedSync(
     if (enqueue_lock.owns_lock()) enqueue_lock.unlock();
     release_workspace();
     if (device_changed) cudaSetDevice(previous_device);
+    const int64_t total_us =
+        elapsedMicros(transfer_start, PagedDiagClock::now());
     if (summary_diag) {
         LOG(INFO) << "NCCL paged transfer summary: id=" << diag_id
                   << " signal=" << signal_value
@@ -2417,6 +2516,13 @@ Status NcclTransport::transferPagedSync(
                   << " layers=" << layer_count
                   << " pages=" << page_count
                   << " page_bytes=" << request.page_bytes
+                  << " job_groups=" << job_group_count
+                  << " workspace_created=" << workspace_created
+                  << " workspace_grew=" << workspace_grew
+                  << " workspace_acquire_us=" << workspace_acquire_us
+                  << " metadata_prepare_us=" << metadata_prepare_us
+                  << " enqueue_lock_wait_us=" << enqueue_lock_wait_us
+                  << " post_remote_signal_us=" << post_remote_signal_us
                   << " ensure_comm_us=" << ensure_comm_us
                   << " set_device_us=" << set_device_us
                   << " malloc_us=" << malloc_us
@@ -2430,9 +2536,83 @@ Status NcclTransport::transferPagedSync(
                   << " event_sync_us=" << event_sync_us
                   << " event_destroy_us=" << event_destroy_us
                   << " free_us=" << free_us
-                  << " total_us="
-                  << elapsedMicros(transfer_start, PagedDiagClock::now())
+                  << " total_us=" << total_us
                   << " status=" << status.ToString();
+    }
+    if (accum_diag) {
+        auto& accum = comm_state->paged_timing;
+        accum.ensure_comm.add(ensure_comm_us);
+        accum.ensure_window.add(ensure_window_us);
+        accum.set_device.add(set_device_us);
+        accum.workspace_acquire.add(workspace_acquire_us);
+        accum.metadata_prepare.add(metadata_prepare_us);
+        accum.enqueue_lock_wait.add(enqueue_lock_wait_us);
+        accum.post_remote_signal.add(post_remote_signal_us);
+        accum.malloc.add(malloc_us);
+        accum.h2d_enqueue.add(page_copy_enqueue_us);
+        accum.put_enqueue.add(put_enqueue_us);
+        accum.ack_enqueue.add(ack_enqueue_us);
+        accum.event_record.add(event_record_us);
+        accum.event_sync.add(event_sync_us);
+        accum.total.add(total_us);
+        accum.job_groups.fetch_add(
+            static_cast<uint64_t>(job_group_count), std::memory_order_relaxed);
+        accum.layers.fetch_add(
+            static_cast<uint64_t>(layer_count), std::memory_order_relaxed);
+        accum.pages.fetch_add(
+            static_cast<uint64_t>(page_count), std::memory_order_relaxed);
+        if (workspace_created) {
+            accum.workspace_creates.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (workspace_grew) {
+            accum.workspace_grows.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!status.ok()) {
+            accum.failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t count =
+            accum.count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const uint64_t interval = pagedGinAccumDiagInterval();
+        if (count % interval == 0) {
+            LOG(INFO) << "NCCL paged transfer accumulated timing: local_rank="
+                      << comm_state->local_rank
+                      << " peer_rank=" << comm_state->peer_rank
+                      << " count=" << count
+                      << " failures=" << accum.failures.load(std::memory_order_relaxed)
+                      << " workspace_creates=" << accum.workspace_creates.load(std::memory_order_relaxed)
+                      << " workspace_grows=" << accum.workspace_grows.load(std::memory_order_relaxed)
+                      << " job_groups=" << accum.job_groups.load(std::memory_order_relaxed)
+                      << " layers=" << accum.layers.load(std::memory_order_relaxed)
+                      << " pages=" << accum.pages.load(std::memory_order_relaxed)
+                      << " avg_ensure_comm_us=" << accum.ensure_comm.average(count)
+                      << " max_ensure_comm_us=" << accum.ensure_comm.maximum()
+                      << " avg_ensure_window_us=" << accum.ensure_window.average(count)
+                      << " max_ensure_window_us=" << accum.ensure_window.maximum()
+                      << " avg_set_device_us=" << accum.set_device.average(count)
+                      << " max_set_device_us=" << accum.set_device.maximum()
+                      << " avg_workspace_acquire_us=" << accum.workspace_acquire.average(count)
+                      << " max_workspace_acquire_us=" << accum.workspace_acquire.maximum()
+                      << " avg_metadata_prepare_us=" << accum.metadata_prepare.average(count)
+                      << " max_metadata_prepare_us=" << accum.metadata_prepare.maximum()
+                      << " avg_enqueue_lock_wait_us=" << accum.enqueue_lock_wait.average(count)
+                      << " max_enqueue_lock_wait_us=" << accum.enqueue_lock_wait.maximum()
+                      << " avg_post_remote_signal_us=" << accum.post_remote_signal.average(count)
+                      << " max_post_remote_signal_us=" << accum.post_remote_signal.maximum()
+                      << " avg_malloc_us=" << accum.malloc.average(count)
+                      << " max_malloc_us=" << accum.malloc.maximum()
+                      << " avg_h2d_enqueue_us=" << accum.h2d_enqueue.average(count)
+                      << " max_h2d_enqueue_us=" << accum.h2d_enqueue.maximum()
+                      << " avg_put_enqueue_us=" << accum.put_enqueue.average(count)
+                      << " max_put_enqueue_us=" << accum.put_enqueue.maximum()
+                      << " avg_ack_enqueue_us=" << accum.ack_enqueue.average(count)
+                      << " max_ack_enqueue_us=" << accum.ack_enqueue.maximum()
+                      << " avg_event_record_us=" << accum.event_record.average(count)
+                      << " max_event_record_us=" << accum.event_record.maximum()
+                      << " avg_event_sync_us=" << accum.event_sync.average(count)
+                      << " max_event_sync_us=" << accum.event_sync.maximum()
+                      << " avg_total_us=" << accum.total.average(count)
+                      << " max_total_us=" << accum.total.maximum();
+        }
     }
     return status;
 }
