@@ -118,6 +118,7 @@ class NcclTransport : public Transport {
 
    private:
     struct CommState;
+    struct PagedWorkspacePool;
     struct WindowState;
     struct TransferContext;
 
@@ -174,6 +175,9 @@ class NcclTransport : public Transport {
 
     std::mutex comm_mutex_;
     std::unordered_map<std::string, std::shared_ptr<CommState>> comms_;
+    std::mutex paged_workspace_pool_mutex_;
+    std::unordered_map<int, std::shared_ptr<PagedWorkspacePool>>
+        paged_workspace_pools_;
     std::mutex window_mutex_;
     std::unordered_map<std::string, std::shared_ptr<WindowState>> windows_;
     std::mutex background_mutex_;

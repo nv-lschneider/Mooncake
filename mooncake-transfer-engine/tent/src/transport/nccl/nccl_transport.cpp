@@ -28,6 +28,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "tent/common/status.h"
@@ -171,7 +172,8 @@ struct PagedTimingAccumulator {
     PagedTimingMetric put_enqueue;
     PagedTimingMetric ack_enqueue;
     PagedTimingMetric event_record;
-    PagedTimingMetric event_sync;
+    PagedTimingMetric event_query_wait;
+    std::atomic<uint64_t> event_queries{0};
     PagedTimingMetric total;
 };
 #define CHECK_NCCL(call)                       \
@@ -368,21 +370,27 @@ struct PagedWorkspace {
     bool in_use = false;
 };
 
+struct NcclTransport::PagedWorkspacePool {
+    explicit PagedWorkspacePool(int device) : device_index(device) {}
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::unique_ptr<PagedWorkspace>> workspaces;
+    PagedTimingAccumulator paged_timing;
+    int device_index = -1;
+};
+
 struct NcclTransport::CommState {
     std::mutex mu;
     std::mutex collective_mu;
     std::mutex enqueue_mu;
     std::mutex remote_signal_mu;
-    std::mutex paged_workspace_mu;
     std::condition_variable remote_signal_cv;
-    std::condition_variable paged_workspace_cv;
     std::condition_variable cv;
     ncclComm_t comm = nullptr;
     ncclDevComm_t dev_comm{};
     bool dev_comm_created = false;
     cudaStream_t completion_stream = nullptr;
-    std::vector<std::unique_ptr<PagedWorkspace>> paged_workspaces;
-    PagedTimingAccumulator paged_timing;
     std::atomic<uint64_t> signal_epoch{0};
     uint64_t next_remote_signal = 1;
     size_t lanes = 1;
@@ -570,8 +578,13 @@ Status NcclTransport::uninstall() {
         for (auto& [_, comm] : comms_) {
             if (comm) {
                 comm->remote_signal_cv.notify_all();
-                comm->paged_workspace_cv.notify_all();
             }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(paged_workspace_pool_mutex_);
+        for (auto& [_, pool] : paged_workspace_pools_) {
+            if (pool) pool->cv.notify_all();
         }
     }
     thread_pool_.reset();
@@ -641,49 +654,76 @@ Status NcclTransport::uninstall() {
     }
 
     {
+        std::lock_guard<std::mutex> lock(paged_workspace_pool_mutex_);
+        for (auto& [device, pool] : paged_workspace_pools_) {
+            if (!pool) continue;
+            int previous_device = 0;
+            auto status = setCudaDevice(device, previous_device);
+            if (!status.ok()) {
+                LOG(WARNING) << "Unable to select CUDA device " << device
+                             << " while destroying paged workspace pool: "
+                             << status.ToString();
+                continue;
+            }
+            std::lock_guard<std::mutex> pool_lock(pool->mu);
+            if (pagedGinAccumDiagEnabled()) {
+                const auto& accum = pool->paged_timing;
+                const uint64_t count =
+                    accum.count.load(std::memory_order_relaxed);
+                if (count > 0) {
+                    LOG(INFO) << "NCCL paged transfer accumulated timing final: pool_device="
+                              << pool->device_index
+                              << " count=" << count
+                              << " failures=" << accum.failures.load(std::memory_order_relaxed)
+                              << " pool_workspaces=" << pool->workspaces.size()
+                              << " workspace_creates=" << accum.workspace_creates.load(std::memory_order_relaxed)
+                              << " workspace_grows=" << accum.workspace_grows.load(std::memory_order_relaxed)
+                              << " event_queries=" << accum.event_queries.load(std::memory_order_relaxed)
+                              << " avg_event_query_wait_us=" << accum.event_query_wait.average(count)
+                              << " max_event_query_wait_us=" << accum.event_query_wait.maximum();
+                }
+            }
+            for (auto& workspace : pool->workspaces) {
+                if (!workspace) continue;
+                if (workspace->in_use) {
+                    LOG(WARNING)
+                        << "Destroying an in-use NCCL paged workspace";
+                }
+                if (workspace->completion_event) {
+                    auto err = cudaEventDestroy(workspace->completion_event);
+                    if (err != cudaSuccess) {
+                        LOG(WARNING) << "cudaEventDestroy(paged workspace): "
+                                     << cudaGetErrorString(err);
+                    }
+                }
+                if (workspace->device_buffer) {
+                    auto err = cudaFree(workspace->device_buffer);
+                    if (err != cudaSuccess) {
+                        LOG(WARNING) << "cudaFree(paged workspace): "
+                                     << cudaGetErrorString(err);
+                    }
+                }
+                if (workspace->host_buffer) {
+                    auto err = cudaFreeHost(workspace->host_buffer);
+                    if (err != cudaSuccess) {
+                        LOG(WARNING) << "cudaFreeHost(paged workspace): "
+                                     << cudaGetErrorString(err);
+                    }
+                }
+            }
+            pool->workspaces.clear();
+            cudaSetDevice(previous_device);
+        }
+        paged_workspace_pools_.clear();
+    }
+
+    {
         std::lock_guard<std::mutex> lock(comm_mutex_);
         for (auto& [_, comm] : comms_) {
             if (comm && comm->ready) {
                 int previous_device = 0;
                 auto status = setCudaDevice(comm->device_index,
                                             previous_device);
-                if (status.ok()) {
-                    std::lock_guard<std::mutex> workspace_lock(
-                        comm->paged_workspace_mu);
-                    for (auto& workspace : comm->paged_workspaces) {
-                        if (!workspace) continue;
-                        if (workspace->in_use) {
-                            LOG(WARNING)
-                                << "Destroying an in-use NCCL paged workspace";
-                        }
-                        if (workspace->completion_event) {
-                            auto err = cudaEventDestroy(
-                                workspace->completion_event);
-                            if (err != cudaSuccess) {
-                                LOG(WARNING)
-                                    << "cudaEventDestroy(paged workspace): "
-                                    << cudaGetErrorString(err);
-                            }
-                        }
-                        if (workspace->device_buffer) {
-                            auto err = cudaFree(workspace->device_buffer);
-                            if (err != cudaSuccess) {
-                                LOG(WARNING)
-                                    << "cudaFree(paged workspace): "
-                                    << cudaGetErrorString(err);
-                            }
-                        }
-                        if (workspace->host_buffer) {
-                            auto err = cudaFreeHost(workspace->host_buffer);
-                            if (err != cudaSuccess) {
-                                LOG(WARNING)
-                                    << "cudaFreeHost(paged workspace): "
-                                    << cudaGetErrorString(err);
-                            }
-                        }
-                    }
-                    comm->paged_workspaces.clear();
-                }
                 if (status.ok() && comm->comm) {
                     if (comm->peer_in_lsa) {
                         LOG(INFO) << "Deferring NCCL LSA communicator cleanup "
@@ -2093,10 +2133,12 @@ Status NcclTransport::transferPagedSync(
     int64_t ack_enqueue_us = 0;
     int64_t event_create_us = 0;
     int64_t event_record_us = 0;
-    int64_t event_sync_us = 0;
+    int64_t event_query_wait_us = 0;
+    uint64_t event_queries = 0;
     int64_t event_destroy_us = 0;
     int64_t free_us = 0;
     size_t job_group_count = 0;
+    size_t workspace_pool_size = 0;
     bool workspace_created = false;
     bool workspace_grew = false;
 
@@ -2156,6 +2198,7 @@ Status NcclTransport::transferPagedSync(
     set_device_us = elapsedMicros(set_device_start, PagedDiagClock::now());
     bool device_changed = status.ok();
     bool work_enqueued = false;
+    std::shared_ptr<PagedWorkspacePool> workspace_pool;
     PagedWorkspace* workspace = nullptr;
     int32_t* d_src_pages = nullptr;
     int32_t* d_dst_pages = nullptr;
@@ -2188,31 +2231,39 @@ Status NcclTransport::transferPagedSync(
     auto release_workspace = [&]() {
         if (!workspace) return;
         {
-            std::lock_guard<std::mutex> lock(
-                comm_state->paged_workspace_mu);
+            std::lock_guard<std::mutex> lock(workspace_pool->mu);
             workspace->in_use = false;
         }
-        comm_state->paged_workspace_cv.notify_one();
+        workspace_pool->cv.notify_one();
         workspace = nullptr;
     };
 
     if (status.ok()) {
+        {
+            std::lock_guard<std::mutex> lock(
+                paged_workspace_pool_mutex_);
+            auto& pool = paged_workspace_pools_[contexts.front().local_device];
+            if (!pool) {
+                pool = std::make_shared<PagedWorkspacePool>(
+                    contexts.front().local_device);
+            }
+            workspace_pool = pool;
+        }
         const auto acquire_start = PagedDiagClock::now();
         const size_t workspace_limit =
             std::max<size_t>(1, params_.max_concurrent_tasks);
         {
-            std::unique_lock<std::mutex> lock(
-                comm_state->paged_workspace_mu);
-            comm_state->paged_workspace_cv.wait(lock, [&] {
+            std::unique_lock<std::mutex> lock(workspace_pool->mu);
+            workspace_pool->cv.wait(lock, [&] {
                 if (shutting_down_.load(std::memory_order_acquire)) {
                     return true;
                 }
-                if (comm_state->paged_workspaces.size() < workspace_limit) {
+                if (workspace_pool->workspaces.size() < workspace_limit) {
                     return true;
                 }
                 return std::any_of(
-                    comm_state->paged_workspaces.begin(),
-                    comm_state->paged_workspaces.end(),
+                    workspace_pool->workspaces.begin(),
+                    workspace_pool->workspaces.end(),
                     [](const auto& candidate) {
                         return candidate && !candidate->in_use;
                     });
@@ -2221,7 +2272,7 @@ Status NcclTransport::transferPagedSync(
                 status = Status::InvalidArgument(
                     "NCCL transport is shutting down" LOC_MARK);
             } else {
-                for (auto& candidate : comm_state->paged_workspaces) {
+                for (auto& candidate : workspace_pool->workspaces) {
                     if (candidate && !candidate->in_use) {
                         workspace = candidate.get();
                         break;
@@ -2231,9 +2282,10 @@ Status NcclTransport::transferPagedSync(
                     auto candidate = std::make_unique<PagedWorkspace>();
                     workspace = candidate.get();
                     workspace_created = true;
-                    comm_state->paged_workspaces.push_back(
+                    workspace_pool->workspaces.push_back(
                         std::move(candidate));
                 }
+                workspace_pool_size = workspace_pool->workspaces.size();
                 workspace->in_use = true;
             }
         }
@@ -2483,18 +2535,23 @@ Status NcclTransport::transferPagedSync(
     if (status.ok()) {
         if (pagedGinDiagEnabled())
         {
-            LOG(INFO) << "NCCL paged sync phase: synchronize event";
+            LOG(INFO) << "NCCL paged sync phase: query completion event";
         }
-        const auto event_sync_start = PagedDiagClock::now();
-        auto err = cudaEventSynchronize(workspace->completion_event);
-        status = cudaStatus(
-            err, "cudaEventSynchronize(paged workspace)");
-        event_sync_us =
-            elapsedMicros(event_sync_start, PagedDiagClock::now());
+        const auto event_query_start = PagedDiagClock::now();
+        cudaError_t err = cudaErrorNotReady;
+        while (err == cudaErrorNotReady) {
+            err = cudaEventQuery(workspace->completion_event);
+            ++event_queries;
+            if (err == cudaErrorNotReady) std::this_thread::yield();
+        }
+        status = cudaStatus(err, "cudaEventQuery(paged workspace)");
+        event_query_wait_us =
+            elapsedMicros(event_query_start, PagedDiagClock::now());
         if (pagedGinDiagEnabled())
         {
-            LOG(INFO) << "NCCL paged sync phase: synchronize event done: "
-                      << status.ToString();
+            LOG(INFO) << "NCCL paged sync phase: completion event ready: "
+                      << status.ToString()
+                      << " queries=" << event_queries;
         }
     } else if (work_enqueued && comm_state) {
         auto err = cudaStreamSynchronize(comm_state->completion_stream);
@@ -2512,11 +2569,15 @@ Status NcclTransport::transferPagedSync(
     if (summary_diag) {
         LOG(INFO) << "NCCL paged transfer summary: id=" << diag_id
                   << " signal=" << signal_value
+                  << " workspace_pool_device="
+                  << (workspace_pool ? workspace_pool->device_index : -1)
                   << " session=" << contexts.front().session_key
                   << " layers=" << layer_count
                   << " pages=" << page_count
                   << " page_bytes=" << request.page_bytes
                   << " job_groups=" << job_group_count
+                  << " workspace_pool_size=" << workspace_pool_size
+                  << " workspace_reused=" << (!workspace_created)
                   << " workspace_created=" << workspace_created
                   << " workspace_grew=" << workspace_grew
                   << " workspace_acquire_us=" << workspace_acquire_us
@@ -2533,14 +2594,15 @@ Status NcclTransport::transferPagedSync(
                   << " ack_enqueue_us=" << ack_enqueue_us
                   << " event_create_us=" << event_create_us
                   << " event_record_us=" << event_record_us
-                  << " event_sync_us=" << event_sync_us
+                  << " event_query_wait_us=" << event_query_wait_us
+                  << " event_queries=" << event_queries
                   << " event_destroy_us=" << event_destroy_us
                   << " free_us=" << free_us
                   << " total_us=" << total_us
                   << " status=" << status.ToString();
     }
-    if (accum_diag) {
-        auto& accum = comm_state->paged_timing;
+    if (accum_diag && workspace_pool) {
+        auto& accum = workspace_pool->paged_timing;
         accum.ensure_comm.add(ensure_comm_us);
         accum.ensure_window.add(ensure_window_us);
         accum.set_device.add(set_device_us);
@@ -2553,7 +2615,9 @@ Status NcclTransport::transferPagedSync(
         accum.put_enqueue.add(put_enqueue_us);
         accum.ack_enqueue.add(ack_enqueue_us);
         accum.event_record.add(event_record_us);
-        accum.event_sync.add(event_sync_us);
+        accum.event_query_wait.add(event_query_wait_us);
+        accum.event_queries.fetch_add(event_queries,
+                                      std::memory_order_relaxed);
         accum.total.add(total_us);
         accum.job_groups.fetch_add(
             static_cast<uint64_t>(job_group_count), std::memory_order_relaxed);
@@ -2574,9 +2638,8 @@ Status NcclTransport::transferPagedSync(
             accum.count.fetch_add(1, std::memory_order_relaxed) + 1;
         const uint64_t interval = pagedGinAccumDiagInterval();
         if (count % interval == 0) {
-            LOG(INFO) << "NCCL paged transfer accumulated timing: local_rank="
-                      << comm_state->local_rank
-                      << " peer_rank=" << comm_state->peer_rank
+            LOG(INFO) << "NCCL paged transfer accumulated timing: pool_device="
+                      << workspace_pool->device_index
                       << " count=" << count
                       << " failures=" << accum.failures.load(std::memory_order_relaxed)
                       << " workspace_creates=" << accum.workspace_creates.load(std::memory_order_relaxed)
@@ -2608,8 +2671,9 @@ Status NcclTransport::transferPagedSync(
                       << " max_ack_enqueue_us=" << accum.ack_enqueue.maximum()
                       << " avg_event_record_us=" << accum.event_record.average(count)
                       << " max_event_record_us=" << accum.event_record.maximum()
-                      << " avg_event_sync_us=" << accum.event_sync.average(count)
-                      << " max_event_sync_us=" << accum.event_sync.maximum()
+                      << " event_queries=" << accum.event_queries.load(std::memory_order_relaxed)
+                      << " avg_event_query_wait_us=" << accum.event_query_wait.average(count)
+                      << " max_event_query_wait_us=" << accum.event_query_wait.maximum()
                       << " avg_total_us=" << accum.total.average(count)
                       << " max_total_us=" << accum.total.maximum();
         }
